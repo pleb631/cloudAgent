@@ -136,8 +136,12 @@ class FakeFiles:
 
     async def read_bytes_stream(self, path, *, chunk_size=8192, limit=None):
         data = self.files[path][:limit]
-        for offset in range(0, len(data), chunk_size):
-            yield data[offset : offset + chunk_size]
+
+        async def chunks():
+            for offset in range(0, len(data), chunk_size):
+                yield data[offset : offset + chunk_size]
+
+        return chunks()
 
 
 class FakeSandbox:

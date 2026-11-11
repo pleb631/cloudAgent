@@ -1,7 +1,11 @@
 import asyncio
 from types import SimpleNamespace as NS
 
+import httpx
 import pytest
+from opensandbox.adapters.filesystem_adapter import FilesystemAdapter
+from opensandbox.config import ConnectionConfig
+from opensandbox.models.sandboxes import SandboxEndpoint
 
 from cloudagent.sandbox_client import MAX_BYTES, OpenSandboxClient, SandboxError
 
@@ -19,11 +23,15 @@ class Files:
         self.data.update({e.path: e.data.encode() for e in entries})
 
     async def read_bytes_stream(self, path, **kwargs):
-        try:
-            for offset in range(0, len(self.data[path]), 8192):
-                yield self.data[path][offset : offset + 8192]
-        finally:
-            self.stream_closed = True
+        # The SDK coroutine returns an async iterator; it is not itself one.
+        async def chunks():
+            try:
+                for offset in range(0, len(self.data[path]), 8192):
+                    yield self.data[path][offset : offset + 8192]
+            finally:
+                self.stream_closed = True
+
+        return chunks()
 
     def info(self, path):
         return NS(
@@ -101,6 +109,46 @@ class Factory:
 def client(**kwargs):
     factory = Factory()
     return OpenSandboxClient("localhost:8090", "server-secret", factory=factory, **kwargs), factory
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload", [b"hello", b"", b"x" * MAX_BYTES, b"x" * (MAX_BYTES + 1)])
+async def test_read_real_sdk_stream_contract_and_cleanup(payload):
+    responses = []
+
+    class PayloadStream(httpx.AsyncByteStream):
+        closed = False
+
+        async def __aiter__(self):
+            for offset in range(0, len(payload), 8192):
+                yield payload[offset : offset + 8192]
+
+        async def aclose(self):
+            self.closed = True
+
+    stream = PayloadStream()
+
+    def download(request):
+        assert request.url.params["path"] == "/workspace/a.txt"
+        response = httpx.Response(200, stream=stream)
+        responses.append(response)
+        return response
+
+    files = FilesystemAdapter(
+        ConnectionConfig(transport=httpx.MockTransport(download)),
+        SandboxEndpoint(endpoint="localhost:44772"),
+    )
+    c, _ = client()
+    try:
+        if len(payload) > MAX_BYTES:
+            with pytest.raises(SandboxError, match="64 KiB"):
+                await c._read(NS(files=files), "/workspace/a.txt")
+        else:
+            assert await c._read(NS(files=files), "/workspace/a.txt") == payload.decode()
+        assert len(responses) == 1 and responses[0].is_closed and stream.closed
+    finally:
+        await files._httpx_client.aclose()
+        await c.close()
 
 
 @pytest.mark.asyncio

@@ -292,7 +292,7 @@ class OpenSandboxClient:
     async def _read(self, sandbox, path):
         data = bytearray()
         async with aclosing(
-            sandbox.files.read_bytes_stream(path, chunk_size=8192, limit=MAX_BYTES + 1)
+            await sandbox.files.read_bytes_stream(path, chunk_size=8192, limit=MAX_BYTES + 1)
         ) as stream:
             async for chunk in stream:
                 if len(data) + len(chunk) > MAX_BYTES:
