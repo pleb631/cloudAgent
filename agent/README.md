@@ -11,7 +11,7 @@ uv run pytest -q
 uv run ruff check .
 ```
 
-必须先启动 Sandbox Manager。Agent 只通过 HTTP 调用 Manager，不依赖其 Python 包，不需要 Docker SDK 或 socket。
+必须先启动 Sandbox Manager。Agent 只通过 HTTP 调用 Manager，不依赖其 Python 包，不需要 Docker SDK 或 socket。运行图由官方 deepagents.create_deep_agent 创建，底层是 LangGraph。
 
 ## 配置
 
@@ -35,7 +35,9 @@ max_iterations: 12
 - Agent 名称必须唯一；未知工具、缺失子智能体和子智能体循环在启动时失败。
 - `tools` 是执行白名单，不是提示词建议。`task`、`load_skill` 也要显式启用。
 - 子智能体的工具权限不超过父智能体，不能通过委派扩大权限；子智能体共享当前工作区，但对话上下文和 todo 独立。
-- skills 作为文本知识按需加载，不自动执行技能目录中的脚本。
+- 官方 SkillsMiddleware 从请求私有的虚拟 /skills/ 目录发现技能元数据；load_skill 按需返回允许的内容，不自动运行技能脚本或访问宿主机文件。
+- task 使用官方 SubAgentMiddleware，模型参数为 description/subagent_type；HTTP客户端不直接发起工具调用。
+- 官方框架默认的文件工具不会直接开放，平台仅注册允许的RPC工具；未配置的通用子智能体和技能动态工具也不会开放。
 - 客户端传入的 system 消息按用户偏好处理，不覆盖运营者配置的顶层系统提示词。
 - 只有运营者能修改配置，不提供让终端用户上传或执行任意 Python 插件的接口。
 

@@ -16,6 +16,7 @@ dependencies = [
   "httpx[socks]>=0.27,<1",
   "langgraph>=1.0,<2",
   "langchain-openai>=1.0,<2",
+  "deepagents>=0.7.35,<0.8",
 ]
 
 [dependency-groups]

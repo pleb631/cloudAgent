@@ -1,8 +1,12 @@
 import asyncio
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
+from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessageChunk, ToolMessage
+from langchain_core.outputs import ChatGenerationChunk
+from pydantic import Field
 
 from cloudagent.runtime import AgentRuntime, IterationLimitError, ProviderError, ToolExecutionError
 
@@ -10,6 +14,7 @@ from cloudagent.runtime import AgentRuntime, IterationLimitError, ProviderError,
 def config(id="main", tools=(), subagents=(), skills=None, max_iterations=5):
     return SimpleNamespace(
         id=id,
+        description="Test agent",
         system_prompt="Configured instructions",
         model="test",
         temperature=0,
@@ -28,21 +33,30 @@ class Registry:
         return self.configs[name]
 
 
-class Model:
+class Model(BaseChatModel):
+    responses: Any
+    histories: list = Field(default_factory=list)
+    tools: list = Field(default_factory=list)
+
     def __init__(self, responses):
-        self.responses = iter(responses)
-        self.histories = []
-        self.tools = []
+        super().__init__(responses=iter(responses))
 
-    def bind_tools(self, tools):
+    @property
+    def _llm_type(self):
+        return "cloudagent-test"
+
+    def bind_tools(self, tools, **kwargs):
         self.tools = tools
-        return self
+        return self.bind(tools=tools)
 
-    async def astream(self, messages):
+    def _generate(self, *args, **kwargs):
+        raise NotImplementedError("Async tests only")
+
+    async def _astream(self, messages, **kwargs):
         self.histories.append(list(messages))
         await asyncio.sleep(0)
         for chunk in next(self.responses):
-            yield chunk
+            yield ChatGenerationChunk(message=chunk)
 
 
 class Sandbox:
@@ -122,7 +136,7 @@ async def test_child_task_result_and_private_todos():
     parent = Model(
         [
             tool("todo", {"items": ["parent"]}),
-            tool("task", {"agent_id": "child", "prompt": "work"}),
+            tool("task", {"subagent_type": "child", "description": "work"}),
             tool("todo", {}),
             [AIMessageChunk(content="Done")],
         ]
@@ -142,7 +156,7 @@ async def test_child_task_result_and_private_todos():
 
 
 async def test_child_cannot_expand_tools():
-    parent = Model([tool("task", {"agent_id": "child", "prompt": "work"})])
+    parent = Model([tool("task", {"subagent_type": "child", "description": "work"})])
     child = Model([tool("execute", {"command": "bad"})])
     sandbox = Sandbox()
     runtime = AgentRuntime(
@@ -159,7 +173,9 @@ async def test_depth_bound():
     runtime = AgentRuntime(
         Registry(config(tools=["task"], subagents=["main"])),
         Sandbox(),
-        model_factory=lambda c: Model([tool("task", {"agent_id": "main", "prompt": "again"})]),
+        model_factory=lambda c: Model(
+            [tool("task", {"subagent_type": "main", "description": "again"})]
+        ),
         max_subagent_depth=1,
     )
     with pytest.raises(ToolExecutionError, match="depth"):
@@ -194,15 +210,15 @@ async def test_provider_errors_are_sanitized():
 async def test_generator_close_cancels_provider():
     cancelled = asyncio.Event()
 
-    class BlockingModel:
-        async def astream(self, messages):
+    class BlockingModel(Model):
+        async def _astream(self, messages, **kwargs):
             try:
-                yield AIMessageChunk(content="start")
+                yield ChatGenerationChunk(message=AIMessageChunk(content="start"))
                 await asyncio.Event().wait()
             finally:
                 cancelled.set()
 
-    runtime = AgentRuntime(Registry(config()), Sandbox(), model_factory=lambda c: BlockingModel())
+    runtime = AgentRuntime(Registry(config()), Sandbox(), model_factory=lambda c: BlockingModel([]))
     stream = runtime.stream([{"role": "user", "content": "go"}], "main", "t", "s")
     assert (await anext(stream))["text"] == "start"
     await stream.aclose()
@@ -213,7 +229,9 @@ async def test_oversized_task_prompt_rejected():
     runtime = AgentRuntime(
         Registry(config(tools=["task"], subagents=["main"])),
         Sandbox(),
-        model_factory=lambda c: Model([tool("task", {"agent_id": "main", "prompt": "x" * 65536})]),
+        model_factory=lambda c: Model(
+            [tool("task", {"subagent_type": "main", "description": "x" * 65536})]
+        ),
     )
     with pytest.raises(ToolExecutionError, match="size limit"):
         await collect(runtime)
@@ -251,3 +269,112 @@ async def test_skill_allowlist_and_loading():
     )
     with pytest.raises(ToolExecutionError, match="Skill is not allowed"):
         await collect(denied)
+
+
+@pytest.mark.parametrize(
+    "name,args",
+    [
+        ("read_file", {"file_path": "/etc/passwd"}),
+        ("write_file", {"file_path": "/tmp/x", "content": "x"}),
+        ("edit_file", {"file_path": "/tmp/x", "old_string": "a", "new_string": "b"}),
+        ("glob", {"pattern": "*"}),
+        ("write_todos", {"todos": []}),
+        ("execute", {"command": "id"}),
+    ],
+)
+async def test_official_builtin_aliases_cannot_bypass_read_only_policy(name, args):
+    model = Model([tool(name, args)])
+    sandbox = Sandbox()
+    runtime = AgentRuntime(Registry(config(tools=["read"])), sandbox, model_factory=lambda c: model)
+    with pytest.raises(ToolExecutionError, match="not allowed"):
+        await collect(runtime)
+    assert {t.name for t in model.tools} == {"read"}
+    assert sandbox.calls == []
+
+
+async def test_implicit_general_purpose_subagent_is_unavailable():
+    model = Model([tool("task", {"subagent_type": "general-purpose", "description": "work"})])
+    runtime = AgentRuntime(
+        Registry(config(tools=["task"], subagents=["child"]), config("child")),
+        Sandbox(),
+        model_factory=lambda c: model,
+    )
+    with pytest.raises(ToolExecutionError, match="Subagent is not allowed"):
+        await collect(runtime)
+    task_tool = next(t for t in model.tools if t.name == "task")
+    assert "general-purpose" not in task_tool.description
+    assert "child" in task_tool.description
+
+
+async def test_native_skill_discovery_uses_virtual_backend_and_progressive_disclosure():
+    model = Model([tool("load_skill", {"name": "research"}), [AIMessageChunk(content="Done")]])
+    runtime = AgentRuntime(
+        Registry(config(tools=["load_skill"], skills={"research": "PRIVATE FULL SKILL TEXT"})),
+        Sandbox(),
+        model_factory=lambda c: model,
+    )
+    await collect(runtime)
+    initial_prompt = str(model.histories[0][0].content)
+    assert "/skills/research/SKILL.md" in initial_prompt
+    assert "load_skill(name)" in initial_prompt
+    assert "PRIVATE FULL SKILL TEXT" not in initial_prompt
+    assert "PRIVATE FULL SKILL TEXT" in model.histories[1][-1].content
+    assert {t.name for t in model.tools} == {"load_skill"}
+
+
+async def test_native_child_keeps_same_sandbox_scope_and_separate_skill_overlay():
+    parent = Model(
+        [
+            tool("task", {"subagent_type": "child", "description": "read the file"}),
+            [AIMessageChunk(content="Done")],
+        ]
+    )
+    child = Model(
+        [
+            tool("read", {"path": "report.txt"}),
+            [
+                AIMessageChunk(
+                    content="Child result",
+                    usage_metadata={"input_tokens": 5, "output_tokens": 2, "total_tokens": 7},
+                )
+            ],
+        ]
+    )
+    sandbox = Sandbox()
+    runtime = AgentRuntime(
+        Registry(
+            config(
+                tools=["task", "read", "load_skill"],
+                subagents=["child"],
+                skills={"common": "parent shared"},
+            ),
+            config(
+                "child",
+                tools=["read", "load_skill"],
+                skills={"common": "child shared", "secret": "SECRET SKILL"},
+            ),
+        ),
+        sandbox,
+        model_factory=lambda c: parent if c.id == "main" else child,
+    )
+    events = await collect(runtime)
+    assert sandbox.calls == [("tenant", "session", "read", {"path": "report.txt"})]
+    assert "/skills/common/SKILL.md" in str(child.histories[0][0].content)
+    assert "/skills/secret/SKILL.md" not in str(child.histories[0][0].content)
+    assert [e["text"] for e in events if e["type"] == "token"] == ["Done"]
+    assert sum(e.get("prompt_tokens", 0) for e in events) == 5
+
+
+async def test_native_skills_preserve_description_without_granting_embedded_tools():
+    model = Model([[AIMessageChunk(content="Done")]])
+    content = "---\nname: wrong-name\ndescription: Search academic literature\ninclude-tools: [execute]\n---\nInstructions"
+    runtime = AgentRuntime(
+        Registry(config(tools=["load_skill"], skills={"research": content})),
+        Sandbox(),
+        model_factory=lambda c: model,
+    )
+    await collect(runtime)
+    prompt = str(model.histories[0][0].content)
+    assert "Search academic literature" in prompt
+    assert "wrong-name" not in prompt
+    assert {t.name for t in model.tools} == {"load_skill"}

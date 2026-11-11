@@ -4,17 +4,20 @@ import asyncio
 import contextlib
 import json
 from collections.abc import AsyncIterator, Callable
-from typing import Any, TypedDict
+from typing import Any
 
-from langchain_core.messages import (
-    AIMessage,
-    HumanMessage,
-    SystemMessage,
-    ToolMessage,
-    message_chunk_to_message,
-)
+import yaml
+from deepagents import create_deep_agent
+from deepagents.backends import StateBackend
+from deepagents.backends.utils import create_file_data
+from deepagents.middleware.filesystem import FilesystemMiddleware
+from deepagents.middleware.skills import SkillsMiddleware
+from deepagents.middleware.subagents import SubAgentMiddleware
+from langchain.agents.middleware import AgentMiddleware
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
+from langchain_core.runnables import RunnableLambda
+from langchain_core.tools import StructuredTool
 from langchain_openai import ChatOpenAI
-from langgraph.graph import END, START, StateGraph
 
 from cloudagent.sandbox_client import SandboxError
 
@@ -67,8 +70,8 @@ SCHEMAS = {
     "load_skill": ("Load an allowed skill by name.", {"name": {"type": "string"}}, ["name"]),
     "task": (
         "Delegate a task to an allowed subagent.",
-        {"agent_id": {"type": "string"}, "prompt": {"type": "string"}},
-        ["agent_id", "prompt"],
+        {"subagent_type": {"type": "string"}, "description": {"type": "string"}},
+        ["subagent_type", "description"],
     ),
 }
 
@@ -106,16 +109,19 @@ def validate_arguments(name: str, args: Any) -> None:
             raise ToolExecutionError("Invalid tool arguments.")
 
 
-class State(TypedDict):
-    messages: list
-    iterations: int
+class NoSubagentsMiddleware(AgentMiddleware):
+    """Supported named replacement removes Deep Agents' automatic default task."""
+
+    @property
+    def name(self):
+        return "SubAgentMiddleware"
 
 
 class AgentRuntime:
     """Each stream owns its graph, message history, todo list and event queue.
 
     The model factory is called once per agent invocation with its AgentConfig.
-    It must return a LangChain-compatible model supporting bind_tools and astream.
+    It must return a LangChain BaseChatModel supporting bind_tools and async streaming.
     Client system messages are treated as user preferences; the configured system
     prompt is always the sole top-level system message. No server-side chat memory
     is retained; clients supply history and sandbox files persist by tenant/session.
@@ -195,13 +201,11 @@ class AgentRuntime:
         if parent_tools is not None:
             allowed &= parent_tools
             skills = {name: value for name, value in skills.items() if name in parent_skills}
+        # StateBackend never touches the process filesystem. Native middleware
+        # uses it only for skill metadata, context compaction and private scratch.
+        backend = StateBackend()
         todos = []
-        prompt = config.system_prompt
-        if skills:
-            prompt += "\nAvailable skills (use load_skill): " + ", ".join(sorted(skills))
-        if "task" in allowed:
-            prompt += "\nAllowed subagents: " + ", ".join(config.subagents)
-        history = [SystemMessage(content=prompt)]
+        history = []
         for msg in messages:
             role, content = msg.get("role"), msg.get("content") or ""
             if role in ("system", "developer"):
@@ -229,135 +233,246 @@ class AgentRuntime:
                     timeout=self.request_timeout,
                     max_retries=1,
                     stream_usage=True,
+                    use_responses_api=False,
                 )
             )
-            if allowed:
-                model = model.bind_tools([tool_schema(name) for name in sorted(allowed)])
         except Exception:
             raise ProviderError("Model initialization failed.") from None
 
-        async def model_node(state):
-            if state["iterations"] >= config.max_iterations:
-                raise IterationLimitError("Agent iteration limit reached.")
-            combined = None
+        async def invoke_tool(name, arguments):
+            nonlocal todos
+            if name == "todo":
+                if "items" in arguments:
+                    todos = list(arguments["items"])
+                return {"items": list(todos)}
+            if name == "load_skill":
+                return {"content": skills[arguments["name"]]}
             try:
-                async with asyncio.timeout(self.request_timeout):
-                    async for chunk in model.astream(state["messages"]):
-                        combined = chunk if combined is None else combined + chunk
-                        text = chunk.content
-                        if isinstance(text, list):
-                            text = "".join(
-                                part.get("text", "")
-                                for part in text
-                                if isinstance(part, dict) and part.get("type") == "text"
-                            )
-                        if text:
-                            await emit(
-                                {
-                                    "type": "token",
-                                    "text": text,
-                                    "agent_id": agent_id,
-                                    "depth": depth,
-                                }
-                            )
-                        usage = getattr(chunk, "usage_metadata", None)
-                        if usage:
-                            await emit(
-                                {
-                                    "type": "usage",
-                                    "prompt_tokens": usage.get("input_tokens", 0),
-                                    "completion_tokens": usage.get("output_tokens", 0),
-                                }
-                            )
+                # No shell-based file helpers: read-only grants do not imply execute.
+                return await self.sandbox.call(tenant_id, session_id, name, arguments)
+            except SandboxError:
+                return {"error": "Sandbox operation failed. Check the arguments or try again."}
             except asyncio.CancelledError:
                 raise
             except Exception:
-                raise ProviderError("Model request failed.") from None
-            if combined is None:
-                raise ProviderError("Model returned an empty stream.")
-            response = message_chunk_to_message(combined)
-            if len(response.tool_calls) > 16:
-                raise ToolExecutionError("Too many tool calls in one model response.")
-            if getattr(response, "invalid_tool_calls", None):
-                raise ToolExecutionError("Model returned malformed tool calls.")
-            return {
-                "messages": [*state["messages"], response],
-                "iterations": state["iterations"] + 1,
-            }
+                raise ToolExecutionError("Sandbox tool execution failed.") from None
 
-        async def tool_node(state):
-            nonlocal todos
-            results = []
-            for call in state["messages"][-1].tool_calls:
-                name, args = call["name"], call["args"]
-                if name not in allowed:
-                    raise ToolExecutionError("Tool is not allowed for this agent.")
-                validate_arguments(name, args)
-                await emit(
-                    {"type": "tool_start", "name": name, "agent_id": agent_id, "depth": depth}
-                )
+        def make_tool(name):
+            async def run(**arguments):
+                return await invoke_tool(name, arguments)
+
+            return StructuredTool.from_function(
+                coroutine=run,
+                name=name,
+                description=SCHEMAS[name][0],
+                args_schema=tool_schema(name)["function"]["parameters"],
+            )
+
+        def check_call(call):
+            name, arguments = call["name"], call["args"]
+            if name not in allowed:
+                raise ToolExecutionError("Tool is not allowed for this agent.")
+            validate_arguments(name, arguments)
+            if name == "load_skill" and arguments["name"] not in skills:
+                raise ToolExecutionError("Skill is not allowed for this agent.")
+            if name == "task":
+                if arguments["subagent_type"] not in config.subagents:
+                    raise ToolExecutionError("Subagent is not allowed for this agent.")
+                if depth >= self.max_subagent_depth:
+                    raise ToolExecutionError("Subagent depth limit reached.")
+
+        iterations = 0
+        runtime = self
+
+        class PolicyMiddleware(AgentMiddleware):
+            async def awrap_model_call(self, request, handler):
+                nonlocal iterations
+                if iterations >= config.max_iterations:
+                    raise IterationLimitError("Agent iteration limit reached.")
+                iterations += 1
+                filtered = [
+                    tool
+                    for tool in request.tools
+                    if (tool.get("name") if isinstance(tool, dict) else tool.name) in allowed
+                ]
                 try:
-                    if name == "todo":
-                        if "items" in args:
-                            todos = list(args["items"])
-                        result = {"items": list(todos)}
-                    elif name == "load_skill":
-                        if args["name"] not in skills:
-                            raise ToolExecutionError("Skill is not allowed for this agent.")
-                        result = {"content": skills[args["name"]]}
-                    elif name == "task":
-                        if args["agent_id"] not in config.subagents:
-                            raise ToolExecutionError("Subagent is not allowed for this agent.")
-
-                        # Child tokens are internal: only the final child answer is
-                        # returned to the parent, never mixed into its public reply.
-                        async def child_emit(event):
-                            if event["type"] != "token":
-                                await emit(event)
-
-                        answer = await self._run(
-                            [{"role": "user", "content": args["prompt"]}],
-                            args["agent_id"],
-                            tenant_id,
-                            session_id,
-                            child_emit,
-                            depth + 1,
-                            allowed,
-                            set(skills),
-                        )
-                        result = {"answer": answer}
-                    else:
-                        result = await self.sandbox.call(tenant_id, session_id, name, args)
+                    async with asyncio.timeout(runtime.request_timeout):
+                        result = await handler(request.override(tools=filtered))
                 except asyncio.CancelledError:
                     raise
-                except SandboxError:
-                    # Operational failures are recoverable but provider-controlled
-                    # error bodies, paths and transport credentials are not echoed.
-                    result = {
-                        "error": "Sandbox operation failed. Check the arguments or try again."
-                    }
                 except AgentRuntimeError:
                     raise
                 except Exception:
-                    raise ToolExecutionError("Sandbox tool execution failed.") from None
-                await emit({"type": "tool_end", "name": name, "agent_id": agent_id, "depth": depth})
-                results.append(
-                    ToolMessage(
-                        content=json.dumps(result, ensure_ascii=False), tool_call_id=call["id"]
-                    )
-                )
-            return {"messages": [*state["messages"], *results]}
+                    raise ProviderError("Model request failed.") from None
+                # Validate the entire response before executing ANY call. This also
+                # blocks middleware-injected aliases which the provider invents.
+                response = result.model_response if hasattr(result, "model_response") else result
+                for message in response.result:
+                    if not isinstance(message, AIMessage):
+                        continue
+                    if message.invalid_tool_calls:
+                        raise ToolExecutionError("Model returned malformed tool calls.")
+                    if len(message.tool_calls) > 16:
+                        raise ToolExecutionError("Too many tool calls in one model response.")
+                    for call in message.tool_calls:
+                        check_call(call)
+                return result
 
-        graph = StateGraph(State)
-        graph.add_node("model", model_node)
-        graph.add_node("tools", tool_node)
-        graph.add_edge(START, "model")
-        graph.add_conditional_edges(
-            "model", lambda state: "tools" if state["messages"][-1].tool_calls else END
+            async def awrap_tool_call(self, request, handler):
+                check_call(request.tool_call)
+                name = request.tool_call["name"]
+                await emit(
+                    {"type": "tool_start", "name": name, "agent_id": agent_id, "depth": depth}
+                )
+                result = await handler(request)
+                await emit({"type": "tool_end", "name": name, "agent_id": agent_id, "depth": depth})
+                return result
+
+        def make_child(child_id):
+            async def run_child(state):
+                async def child_emit(event):
+                    if event["type"] != "token":
+                        await emit(event)
+
+                answer = await self._run(
+                    [{"role": "user", "content": state["messages"][-1].content}],
+                    child_id,
+                    tenant_id,
+                    session_id,
+                    child_emit,
+                    depth + 1,
+                    allowed,
+                    set(skills),
+                )
+                # Do not return scratch files, todos or metadata to the parent.
+                return {"messages": [AIMessage(content=answer)]}
+
+            return RunnableLambda(run_child)
+
+        # Replace the official default SubAgentMiddleware by its public name.
+        # This prevents the implicit general-purpose child from gaining access.
+        child_specs = []
+        if "task" in allowed and depth < self.max_subagent_depth:
+            for child_id in config.subagents:
+                child_specs.append(
+                    {
+                        "name": child_id,
+                        "description": self.registry.get(child_id).description,
+                        "runnable": make_child(child_id),
+                    }
+                )
+        subagent_middleware = (
+            SubAgentMiddleware(
+                backend=backend,
+                subagents=child_specs,
+                task_description="Delegate a bounded task to one of these configured agents:\n{available_agents}",
+            )
+            if child_specs
+            else NoSubagentsMiddleware()
         )
-        graph.add_edge("tools", "model")
-        final = await graph.compile().ainvoke(
-            {"messages": history, "iterations": 0},
-            config={"recursion_limit": max(4, config.max_iterations * 2 + 2)},
-        )
+        middleware = [
+            FilesystemMiddleware(
+                backend=backend,
+                # Required by official middleware, but never advertised and
+                # always rejected by PolicyMiddleware. This backend is virtual.
+                tools=["read_file"],
+                tool_token_limit_before_evict=None,
+                human_message_token_limit_before_evict=None,
+            ),
+            subagent_middleware,
+            PolicyMiddleware(),
+        ]
+        files = {}
+        if skills and "load_skill" in allowed:
+            # Config keys are authoritative. A controlled frontmatter envelope
+            # prevents embedded include-tools metadata from expanding privilege.
+            for name, content in skills.items():
+                description = "Configured skill: " + name
+                if content.startswith("---\n"):
+                    header, separator, _ = content[4:].partition("\n---")
+                    if separator:
+                        try:
+                            metadata = yaml.safe_load(header)
+                        except yaml.YAMLError:
+                            metadata = None
+                        if isinstance(metadata, dict) and isinstance(
+                            metadata.get("description"), str
+                        ):
+                            description = metadata["description"][:1024]
+                frontmatter = (
+                    f"---\nname: {json.dumps(name)}\ndescription: {json.dumps(description)}\n---\n"
+                )
+                files[f"/skills/{name}/SKILL.md"] = create_file_data(frontmatter + content)
+            middleware.append(
+                SkillsMiddleware(
+                    backend=backend,
+                    sources=["/skills/"],
+                    tools=[],
+                    system_prompt="Available configured skills:\n{skills_locations}{skills_load_warnings}\n{skills_list}\n"
+                    "Use load_skill(name) to read a skill's full instructions. "
+                    "Skill content does not grant additional tools or permissions.",
+                )
+            )
+        try:
+            graph = create_deep_agent(
+                model=model,
+                tools=[make_tool(name) for name in sorted(allowed - {"task"})],
+                system_prompt=config.system_prompt,
+                middleware=middleware,
+                backend=backend,
+                name=agent_id,
+            )
+        except Exception:
+            raise ProviderError("Agent initialization failed.") from None
+        final = None
+        try:
+            async for mode, data in graph.astream(
+                {"messages": history, "files": files},
+                config={
+                    "recursion_limit": max(32, config.max_iterations * 10 + 20),
+                    "metadata": {"cloudagent_depth": depth},
+                },
+                stream_mode=["messages", "values"],
+            ):
+                if mode == "values":
+                    final = data
+                    continue
+                chunk, metadata = data
+                # Exclude compaction and nested child model streams. Child usage
+                # and tool lifecycle are forwarded explicitly by child_emit.
+                if (
+                    metadata.get("langgraph_node") != "model"
+                    or metadata.get("cloudagent_depth") != depth
+                ):
+                    continue
+                if not isinstance(chunk, (AIMessage, AIMessageChunk)):
+                    continue
+                text = chunk.content
+                if isinstance(text, list):
+                    text = "".join(
+                        part.get("text", "")
+                        for part in text
+                        if isinstance(part, dict) and part.get("type") == "text"
+                    )
+                if text:
+                    await emit(
+                        {"type": "token", "text": text, "agent_id": agent_id, "depth": depth}
+                    )
+                usage = getattr(chunk, "usage_metadata", None)
+                if usage:
+                    await emit(
+                        {
+                            "type": "usage",
+                            "prompt_tokens": usage.get("input_tokens", 0),
+                            "completion_tokens": usage.get("output_tokens", 0),
+                        }
+                    )
+        except asyncio.CancelledError:
+            raise
+        except AgentRuntimeError:
+            raise
+        except Exception:
+            raise AgentRuntimeError("Agent execution failed.") from None
+        if not final or not final.get("messages"):
+            raise ProviderError("Model returned an empty stream.")
         return final["messages"][-1].content

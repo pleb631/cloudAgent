@@ -43,7 +43,7 @@ class AgentConfig(BaseModel):
     model: str = Field(default="gpt-4.1-mini", min_length=1, max_length=256)
     temperature: float = Field(default=0, ge=0, le=2)
     tools: list[str] = Field(default_factory=list)
-    skills: dict[str, str] = Field(default_factory=dict)
+    skills: dict[Name, str] = Field(default_factory=dict)
     subagents: list[Name] = Field(default_factory=list)
     max_iterations: int = Field(default=12, ge=1, le=50)
 

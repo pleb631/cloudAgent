@@ -8,9 +8,9 @@ Agent service (FastAPI, one process)
   ├─ API Key → tenant
   ├─ YAML registry → system prompt / tools / skills / subagents
   ├─ per-tenant admission + per-session exclusion
-  └─ LangGraph model ↔ tools loop
+  └─ Official Deep Agents graph (LangGraph)
        ├─ OpenAI-compatible upstream model
-       ├─ todo / load_skill / task: in-process, run-scoped
+       ├─ official skills/subagent middleware + scoped todo/load_skill tools
        └─ execute / file tools: internal HTTP RPC
             ▼
 Sandbox Manager (separate service, one process)
@@ -59,3 +59,9 @@ Manager 不接受任意镜像、挂载点、容器启动参数或宿主机路径
 5. 增加持久化 checkpoint、重试策略、可观测性和工作区生命周期管理。
 
 这些是后续方向，不是当前版本已有功能。
+
+## 官方 Deep Agents 集成边界
+
+运行时通过官方 `deepagents.create_deep_agent` 创建图，不再自行实现 StateGraph 的 model/tools 循环。官方 SubAgentMiddleware 调用配置的子图，SkillsMiddleware 在请求私有的 StateBackend 中发现技能。内存后端仅保存技能与框架临时状态，不把业务文件写入 Agent 主机。业务文件和命令仍经已有 Sandbox Manager RPC。
+
+为保持业务工具白名单，平台关闭框架自动注入的通用文件工具和通用子智能体，再显式注册受限工具。每次模型调用和工具执行均检查允许列表。todo/load_skill 是平台工具，task 由官方中间件提供。对外的 OpenAI 文本/SSE 契约保持不变。

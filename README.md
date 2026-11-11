@@ -1,23 +1,23 @@
 # cloudAgent
 
-基于 **FastAPI + LangGraph** 的配置驱动业务 Agent 平台首版。Agent 和沙箱是两个独立 Python 工程，可分别安装、测试和部署。
+基于 **FastAPI + 官方 Deep Agents + LangGraph** 的配置驱动业务 Agent 平台首版。Agent 和沙箱是两个独立 Python 工程，可分别安装、测试和部署。
 
 ## 已实现
 
 - 本地 YAML 定义 Agent，支持独立系统提示词、模型、工具白名单、skills 和子智能体。
-- 真实 LangGraph 工具调用循环；使用 OpenAI 兼容模型服务，通过 `langchain-openai` 异步流式调用。
+- 使用官方 `deepagents.create_deep_agent` 创建 LangGraph 运行图；使用 OpenAI 兼容模型服务，通过 `langchain-openai` 异步流式调用。
 - `execute / read / write / edit / ls / grep / todo`、按需加载 skill、子智能体委派。
 - `/v1/chat/completions` 普通响应和 SSE 流式响应，`/v1/models` 列出可选 Agent。
 - API Key → 租户映射。会话归属由服务端鉴权决定，不信任请求的 `user` 字段。
 - 独立 Sandbox Manager。执行容器是它创建的兄弟容器；Agent 服务不能访问 Docker socket。
 - 并发请求、租户限流、同会话互斥、请求大小限制、运行超时与请求取消后的并发名额释放。
 
-本项目实现 Deep Agents 风格的规划、文件、skills 和子智能体能力，**直接使用 LangGraph，不依赖 `deepagents` 包**。首版没有管理 UI、持久化对话数据库、计费或生产级调度系统。
+本项目实际依赖官方 `deepagents`，使用其 Agent 运行图、SubAgentMiddleware、SkillsMiddleware 和上下文管理能力。文件/执行工具通过平台的受限 RPC 接口接入独立 Sandbox Manager，todo/load_skill 保留平台的命名和权限控制。首版没有管理 UI、持久化对话数据库、计费或生产级调度系统。
 
 ## 目录
 
 ```text
-agent/                      # Agent API / LangGraph 运行时
+agent/                      # Agent API / Deep Agents 运行时
   src/cloudagent/           # API、配置、运行时、沙箱 RPC 客户端
   agents/                  # Agent YAML、提示词、skills
   tests/                   # API、配置、运行时测试
@@ -85,7 +85,7 @@ for chunk in stream:
 make install
 make test
 make lint
-make smoke  # 真实 HTTP 端到端：模拟模型 → Agent → 本地 Sandbox Manager
+make smoke  # 真实 HTTP 端到端：模拟模型 → Deep Agents → 本地 Sandbox Manager
 ```
 
 每个服务可单独操作：

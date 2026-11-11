@@ -193,7 +193,7 @@ def main():
             )
             assert "smoke test complete" in streamed and "[DONE]" in streamed, streamed
             print(
-                "PASS: real HTTP, LangGraph + OpenAI SDK, sandbox write/read, nonstream + SSE"
+                "PASS: real HTTP, official Deep Agents + LangGraph + OpenAI SDK, sandbox write/read, nonstream + SSE"
             )
         finally:
             for process in reversed(processes):

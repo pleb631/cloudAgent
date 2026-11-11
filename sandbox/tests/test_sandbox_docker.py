@@ -1,6 +1,7 @@
 """Opt-in integration tests against a disposable Docker daemon."""
 
 import os
+import shlex
 import uuid
 
 import pytest
@@ -35,6 +36,18 @@ def test_real_runtime_persistence_isolation_and_limits():
         with pytest.raises(ValueError):
             call("read", {"path": "hello.txt"}, owner=tenant + "-other")
         assert call("execute", {"command": "id -u"})["output"].strip() == "10001"
+        command = (
+            "from pathlib import Path; "
+            "s=dict(line.split(':',1) for line in Path('/proc/self/status').read_text().splitlines()); "
+            "assert int(s['CapEff'].strip(),16)==0; assert s['NoNewPrivs'].strip()=='1'; "
+            "mounts=Path('/proc/mounts').read_text().splitlines(); "
+            "assert any(x.split()[1]=='/' and 'ro' in x.split()[3].split(',') for x in mounts); "
+            "assert not Path('/var/run/docker.sock').exists(); print('restricted')"
+        )
+        constraints = call("execute", {"command": "python -I -c " + shlex.quote(command)})
+        assert constraints["exit_code"] == 0, constraints
+        assert constraints["output"].strip() == "restricted"
+
         result = call(
             "execute",
             {

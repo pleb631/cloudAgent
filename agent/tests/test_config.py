@@ -34,3 +34,8 @@ def test_keys_and_no_agents(tmp_path):
         Settings(api_keys={"short": "alice"})
     with pytest.raises(ValueError, match="No agent"):
         AgentRegistry.load(tmp_path)
+
+
+def test_skill_names_cannot_inject_virtual_paths():
+    with pytest.raises(ValueError):
+        AgentConfig(id="a", system_prompt="hello", skills={"../../escape": "bad"})
