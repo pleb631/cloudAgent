@@ -1,7 +1,7 @@
 """Validated, operator-controlled agent definitions. Reload by restarting the service."""
 
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
@@ -18,13 +18,28 @@ class Settings(BaseSettings):
     api_keys: dict[str, Name] = Field(default_factory=dict, repr=False)
     llm_api_key: SecretStr = SecretStr("")
     llm_base_url: str = "https://api.openai.com/v1"
-    sandbox_url: str = "http://127.0.0.1:8001"
-    sandbox_token: SecretStr = SecretStr("")
+    opensandbox_domain: str = "127.0.0.1:8090"
+    opensandbox_protocol: Literal["http", "https"] = "http"
+    opensandbox_api_key: SecretStr = SecretStr("")
+    sandbox_image: str = Field(default="python:3.12-slim", min_length=1, max_length=256)
+    sandbox_ttl_seconds: int = Field(default=600, ge=120, le=3600)
+    sandbox_cpu: float = Field(default=1, ge=0.1, le=8)
+    sandbox_memory: str = Field(default="512Mi", pattern=r"^[1-9][0-9]*(Mi|Gi)$")
+    max_sandbox_sessions: int = Field(default=50, ge=1, le=500)
+    max_sandbox_sessions_per_tenant: int = Field(default=10, ge=1, le=100)
     max_concurrent_runs: int = Field(default=20, ge=1, le=1000)
     max_runs_per_tenant: int = Field(default=4, ge=1, le=100)
     request_timeout: float = Field(default=120, ge=1, le=1800)
     run_timeout: float = Field(default=300, ge=1, le=3600)
     max_request_bytes: int = Field(default=1_048_576, ge=1024, le=10_485_760)
+
+    @field_validator("sandbox_memory")
+    @classmethod
+    def validate_memory(cls, value: str) -> str:
+        mib = int(value[:-2]) * (1024 if value.endswith("Gi") else 1)
+        if not 128 <= mib <= 8192:
+            raise ValueError("Sandbox memory must be between 128Mi and 8Gi")
+        return value
 
     @field_validator("api_keys")
     @classmethod

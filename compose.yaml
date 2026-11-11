@@ -1,20 +1,26 @@
+# Linux Docker host only. Trusted API services use host networking but bind loopback;
+# execution containers created by OpenSandbox use their own bridge network namespace.
 services:
   agent:
     build: ./agent
-    ports:
-      - "127.0.0.1:8000:8000"
+    network_mode: host
+    command: [/app/.venv/bin/uvicorn, cloudagent.api:app, --host, "127.0.0.1", --port, "8000", --workers, "1"]
     environment:
       CLOUDAGENT_API_KEYS: ${CLOUDAGENT_API_KEYS:?Set CLOUDAGENT_API_KEYS in .env}
       CLOUDAGENT_LLM_API_KEY: ${CLOUDAGENT_LLM_API_KEY:?Set CLOUDAGENT_LLM_API_KEY in .env}
       CLOUDAGENT_LLM_BASE_URL: ${CLOUDAGENT_LLM_BASE_URL:-https://api.openai.com/v1}
       CLOUDAGENT_AGENTS_DIR: /app/agents
-      CLOUDAGENT_SANDBOX_URL: http://sandbox:8001
-      CLOUDAGENT_SANDBOX_TOKEN: ${SANDBOX_TOKEN:?Set SANDBOX_TOKEN in .env}
+      CLOUDAGENT_OPENSANDBOX_DOMAIN: 127.0.0.1:8090
+      CLOUDAGENT_OPENSANDBOX_API_KEY: ${OPENSANDBOX_SERVER_API_KEY:?Set OPENSANDBOX_SERVER_API_KEY in .env}
+      CLOUDAGENT_SANDBOX_IMAGE: ${CLOUDAGENT_SANDBOX_IMAGE:-python:3.12-slim}
+      CLOUDAGENT_SANDBOX_TTL_SECONDS: ${CLOUDAGENT_SANDBOX_TTL_SECONDS:-600}
+      CLOUDAGENT_SANDBOX_CPU: ${CLOUDAGENT_SANDBOX_CPU:-1}
+      CLOUDAGENT_SANDBOX_MEMORY: ${CLOUDAGENT_SANDBOX_MEMORY:-512Mi}
     volumes:
       - ./agent/agents:/app/agents:ro
     depends_on:
       sandbox:
-        condition: service_started
+        condition: service_healthy
     read_only: true
     tmpfs:
       - /tmp:size=64m,mode=1777
@@ -24,30 +30,33 @@ services:
     mem_limit: 1g
     cpus: 2
     restart: unless-stopped
-    networks: [control, outbound]
 
   sandbox:
+    # The image runs the unmodified, locked official opensandbox-server==1.2.0.
     build: ./sandbox
+    network_mode: host
     environment:
-      SANDBOX_TOKEN: ${SANDBOX_TOKEN:?Set SANDBOX_TOKEN in .env}
-      SANDBOX_BACKEND: docker
-      SANDBOX_IMAGE: cloudagent-sandbox-runtime:local
-      SANDBOX_MAX_CONCURRENT: 4
-    # This grants daemon control to the trusted Manager only. Never mount in agent/runtime.
+      HOME: /var/lib/opensandbox
+      OPENSANDBOX_SERVER_API_KEY: ${OPENSANDBOX_SERVER_API_KEY:?Set OPENSANDBOX_SERVER_API_KEY in .env}
     volumes:
+      # Host-equivalent authority belongs only to the trusted official server.
       - /var/run/docker.sock:/var/run/docker.sock
+      - opensandbox-state:/var/lib/opensandbox
     read_only: true
     tmpfs:
-      - /tmp:size=64m,mode=1777
+      - /tmp:size=128m,mode=1777
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
-    pids_limit: 128
-    mem_limit: 512m
+    pids_limit: 256
+    mem_limit: 1g
     cpus: 1
+    healthcheck:
+      test: [CMD, /app/.venv/bin/python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/health', timeout=3)"]
+      interval: 5s
+      timeout: 4s
+      retries: 20
+      start_period: 10s
     restart: unless-stopped
-    networks: [control]
 
-networks:
-  control:
-    internal: true
-  outbound: {}
+volumes:
+  opensandbox-state:

@@ -1,14 +1,13 @@
-"""Real HTTP end-to-end smoke test: API -> fake OpenAI server -> local Sandbox Manager.
+"""Real HTTP end-to-end smoke test: API -> fake OpenAI server -> official SDK adapter.
 
-Run `make install` first, then `python scripts/smoke_test.py`. No provider credentials,
-Docker, or internet required. This validates wiring, not production Docker isolation.
+Run `make install` first, then `python scripts/smoke_test.py`. Default mode uses an in-memory fake SDK sandbox and requires no Docker or provider key.
+Set RUN_OPENSANDBOX_TESTS=1 with a running official server for real sandbox verification.
 """
 
 import json
 import os
 import socket
 import subprocess
-import tempfile
 import threading
 import time
 import urllib.error
@@ -106,7 +105,7 @@ def request(url, body=None):
             "X-Session-ID": "smoke-session",
         },
     )
-    with urllib.request.urlopen(req, timeout=15) as response:
+    with urllib.request.urlopen(req, timeout=120) as response:
         return response.read().decode()
 
 
@@ -122,89 +121,127 @@ def ready(url, process):
     raise RuntimeError(f"Service did not become ready: {url}")
 
 
+class FakeFiles:
+    def __init__(self):
+        self.files = {}
+
+    async def create_directories(self, entries):
+        pass
+
+    async def write_files(self, entries):
+        for entry in entries:
+            self.files[entry.path] = (
+                entry.data.encode() if isinstance(entry.data, str) else entry.data
+            )
+
+    async def read_bytes_stream(self, path, *, chunk_size=8192, limit=None):
+        data = self.files[path][:limit]
+        for offset in range(0, len(data), chunk_size):
+            yield data[offset : offset + chunk_size]
+
+
+class FakeSandbox:
+    """Explicit smoke-only SDK double. No production fallback exists."""
+
+    def __init__(self):
+        self.files = FakeFiles()
+        self.id = "fake-smoke-sandbox"
+
+    @classmethod
+    async def create(cls, *args, **kwargs):
+        return cls()
+
+    async def renew(self, ttl):
+        pass
+
+    async def kill(self):
+        pass
+
+    async def close(self):
+        pass
+
+
+def build_app():
+    # Imported only by the child interpreter in agent/.venv.
+    from cloudagent.api import create_app
+    from cloudagent.config import Settings
+    from cloudagent.sandbox_client import OpenSandboxClient
+
+    settings = Settings()
+    if os.environ.get("RUN_OPENSANDBOX_TESTS") == "1":
+        return create_app(settings)
+    client = OpenSandboxClient(
+        settings.opensandbox_domain,
+        settings.opensandbox_api_key.get_secret_value(),
+        factory=FakeSandbox.create,
+    )
+    return create_app(settings, sandbox=client)
+
+
 def main():
-    manager_port, api_port = free_port(), free_port()
+    api_port = free_port()
     provider = ThreadingHTTPServer(("127.0.0.1", 0), Provider)
     thread = threading.Thread(target=provider.serve_forever, daemon=True)
     thread.start()
-    processes = []
-    with tempfile.TemporaryDirectory(prefix="cloudagent-smoke-") as directory:
-        try:
-
-            def launch(service, module, port, variables):
-                process = subprocess.Popen(
-                    [
-                        str(ROOT / service / ".venv/bin/python"),
-                        "-m",
-                        "uvicorn",
-                        module,
-                        "--host",
-                        "127.0.0.1",
-                        "--port",
-                        str(port),
-                        "--log-level",
-                        "warning",
-                    ],
-                    cwd=ROOT / service,
-                    env={**os.environ, **variables},
-                )
-                processes.append(process)
-                return process
-
-            manager = launch(
-                "sandbox",
-                "sandbox_service.manager:app",
-                manager_port,
-                {
-                    "SANDBOX_TOKEN": TEST_TOKEN,
-                    "SANDBOX_BACKEND": "local",
-                    "SANDBOX_LOCAL_ROOT": directory,
-                },
-            )
-            ready(f"http://127.0.0.1:{manager_port}/health", manager)
-            api = launch(
-                "agent",
-                "cloudagent.api:app",
-                api_port,
-                {
-                    "CLOUDAGENT_API_KEYS": json.dumps({TEST_TOKEN: "smoke-user"}),
-                    "CLOUDAGENT_LLM_API_KEY": "test-provider-key",
-                    "CLOUDAGENT_LLM_BASE_URL": f"http://127.0.0.1:{provider.server_port}/v1",
-                    "CLOUDAGENT_SANDBOX_URL": f"http://127.0.0.1:{manager_port}",
-                    "CLOUDAGENT_SANDBOX_TOKEN": TEST_TOKEN,
-                    "CLOUDAGENT_AGENTS_DIR": str(ROOT / "agent/agents"),
-                },
-            )
-            ready(f"http://127.0.0.1:{api_port}/healthz", api)
-            payload = {
-                "model": "assistant",
-                "messages": [{"role": "user", "content": "Write and read a file"}],
-            }
-            result = json.loads(
-                request(f"http://127.0.0.1:{api_port}/v1/chat/completions", payload)
-            )
-            assert (
-                result["choices"][0]["message"]["content"] == "smoke test complete"
-            ), result
-            assert result["usage"]["total_tokens"] == 6, result
-            streamed = request(
-                f"http://127.0.0.1:{api_port}/v1/chat/completions",
-                {**payload, "stream": True},
-            )
-            assert "smoke test complete" in streamed and "[DONE]" in streamed, streamed
-            print(
-                "PASS: real HTTP, official Deep Agents + LangGraph + OpenAI SDK, sandbox write/read, nonstream + SSE"
-            )
-        finally:
-            for process in reversed(processes):
-                process.terminate()
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait()
-            provider.shutdown()
-            provider.server_close()
+    process = None
+    try:
+        code = (
+            "import sys; sys.path.insert(0, " + repr(str(ROOT / "scripts")) + "); "
+            "import uvicorn; from smoke_test import build_app; "
+            "uvicorn.run(build_app(), host='127.0.0.1', port="
+            + str(api_port)
+            + ", log_level='warning')"
+        )
+        environment = {
+            **os.environ,
+            "CLOUDAGENT_API_KEYS": json.dumps({TEST_TOKEN: "smoke-user"}),
+            "CLOUDAGENT_LLM_API_KEY": "test-provider-key",
+            "CLOUDAGENT_LLM_BASE_URL": f"http://127.0.0.1:{provider.server_port}/v1",
+            "CLOUDAGENT_OPENSANDBOX_API_KEY": os.environ.get(
+                "CLOUDAGENT_OPENSANDBOX_API_KEY", TEST_TOKEN
+            ),
+            "CLOUDAGENT_AGENTS_DIR": str(ROOT / "agent/agents"),
+        }
+        process = subprocess.Popen(
+            [str(ROOT / "agent/.venv/bin/python"), "-c", code],
+            cwd=ROOT / "agent",
+            env=environment,
+        )
+        ready(f"http://127.0.0.1:{api_port}/healthz", process)
+        payload = {
+            "model": "assistant",
+            "messages": [{"role": "user", "content": "Write and read a file"}],
+        }
+        result = json.loads(
+            request(f"http://127.0.0.1:{api_port}/v1/chat/completions", payload)
+        )
+        assert result["choices"][0]["message"]["content"] == "smoke test complete", (
+            result
+        )
+        assert result["usage"]["total_tokens"] == 6, result
+        streamed = request(
+            f"http://127.0.0.1:{api_port}/v1/chat/completions",
+            {**payload, "stream": True},
+        )
+        assert "smoke test complete" in streamed and "[DONE]" in streamed, streamed
+        mode = (
+            "real OpenSandbox"
+            if os.environ.get("RUN_OPENSANDBOX_TESTS") == "1"
+            else "mock OpenSandbox SDK"
+        )
+        print(
+            f"PASS: real HTTP, official Deep Agents, {mode}, write/read, nonstream + SSE"
+        )
+    finally:
+        if process:
+            process.terminate()
+            try:
+                process.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        provider.shutdown()
+        provider.server_close()
 
 
 if __name__ == "__main__":

@@ -1,10 +1,11 @@
+# Thin deployment image: the lifecycle API is upstream OpenSandbox, not local code.
 FROM python:3.12-slim
 WORKDIR /app
 RUN pip install --no-cache-dir uv==0.13.6
-COPY pyproject.toml uv.lock README.md ./
-RUN uv sync --frozen --no-dev --no-install-project
-COPY src ./src
+COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev
+COPY config.toml /etc/opensandbox/config.toml
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
-EXPOSE 8001
-CMD ["/app/.venv/bin/uvicorn", "sandbox_service.manager:app", "--host", "0.0.0.0", "--port", "8001", "--workers", "1"]
+EXPOSE 8090
+ENTRYPOINT ["/app/.venv/bin/opensandbox-server"]
+CMD ["--config", "/etc/opensandbox/config.toml"]

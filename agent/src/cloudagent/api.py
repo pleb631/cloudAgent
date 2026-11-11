@@ -15,7 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from starlette.background import BackgroundTask
 
 from cloudagent.config import AgentRegistry, Settings
-from cloudagent.sandbox_client import HttpSandboxClient
+from cloudagent.sandbox_client import OpenSandboxClient
 
 logger = logging.getLogger(__name__)
 
@@ -132,14 +132,22 @@ def create_app(
         app.state.registry = registry or AgentRegistry.load(settings.agents_dir)
         client = sandbox
         if runtime is None:
-            if len(settings.sandbox_token.get_secret_value()) < 32:
-                raise RuntimeError("Set CLOUDAGENT_SANDBOX_TOKEN (at least 32 characters)")
+            if len(settings.opensandbox_api_key.get_secret_value()) < 32:
+                raise RuntimeError("Set CLOUDAGENT_OPENSANDBOX_API_KEY (at least 32 characters)")
             if not settings.llm_api_key.get_secret_value():
                 raise RuntimeError("Set CLOUDAGENT_LLM_API_KEY before starting the service")
             from cloudagent.runtime import AgentRuntime
 
-            client = sandbox or HttpSandboxClient(
-                settings.sandbox_url, settings.sandbox_token.get_secret_value()
+            client = sandbox or OpenSandboxClient(
+                settings.opensandbox_domain,
+                settings.opensandbox_api_key.get_secret_value(),
+                protocol=settings.opensandbox_protocol,
+                image=settings.sandbox_image,
+                ttl_seconds=settings.sandbox_ttl_seconds,
+                cpu=str(settings.sandbox_cpu),
+                memory=settings.sandbox_memory,
+                max_sessions=settings.max_sandbox_sessions,
+                max_sessions_per_tenant=settings.max_sandbox_sessions_per_tenant,
             )
             app.state.runtime = AgentRuntime(
                 app.state.registry,

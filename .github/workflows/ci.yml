@@ -28,8 +28,19 @@ jobs:
       - name: Tests
         working-directory: ${{ matrix.service }}
         run: uv run --frozen pytest -q
-  docker:
+
+  opensandbox:
+    # Disposable Linux host with real Docker, not a mocked lifecycle server.
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CLOUDAGENT_API_KEYS: '{"ci-key-not-a-real-secret-at-least-32-characters":"ci"}'
+      CLOUDAGENT_LLM_API_KEY: ci-not-real-key
+      OPENSANDBOX_SERVER_API_KEY: ci-opensandbox-key-not-real-at-least-32-characters
+      CLOUDAGENT_OPENSANDBOX_DOMAIN: 127.0.0.1:8090
+      CLOUDAGENT_OPENSANDBOX_API_KEY: ci-opensandbox-key-not-real-at-least-32-characters
+      CLOUDAGENT_SANDBOX_IMAGE: python:3.12-slim
+      RUN_OPENSANDBOX_TESTS: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
@@ -38,24 +49,44 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Build service images
+      - name: Validate deployment and build services
         run: |
-          docker build -t cloudagent-agent:ci agent
-          docker build -t cloudagent-manager:ci sandbox
-          docker build -t cloudagent-sandbox-runtime:local -f sandbox/Dockerfile.runtime sandbox
-      - name: Docker integration tests
-        working-directory: sandbox
-        env:
-          RUN_DOCKER_TESTS: "1"
-          SANDBOX_IMAGE: cloudagent-sandbox-runtime:local
-        run: uv run --frozen pytest -q -m docker
-      - name: Validate Compose configuration
-        env:
-          CLOUDAGENT_API_KEYS: '{"ci-key-not-a-real-secret-at-least-32-characters":"ci"}'
-          CLOUDAGENT_LLM_API_KEY: ci-not-real-key
-          SANDBOX_TOKEN: ci-manager-token-not-real-at-least-32-characters
-        run: docker compose config --quiet
-  integration:
+          docker compose config --quiet
+          docker compose build
+      - name: Pull coordinated official components and execution image
+        run: |
+          docker pull opensandbox/execd:release-1.2.0
+          docker pull opensandbox/egress:release-1.2.0
+          docker pull "$CLOUDAGENT_SANDBOX_IMAGE"
+      - name: Start the official OpenSandbox server
+        run: docker compose up -d --wait --wait-timeout 120 sandbox
+      - name: Check lifecycle authentication
+        run: |
+          status=$(curl -sS -o /tmp/unauthorized.json -w '%{http_code}' http://127.0.0.1:8090/v1/sandboxes)
+          test "$status" = 401
+          curl --fail --silent --show-error -H "OPEN-SANDBOX-API-KEY: $OPENSANDBOX_SERVER_API_KEY" http://127.0.0.1:8090/v1/sandboxes
+      - name: Real SDK adapter integration
+        run: |
+          uv sync --project agent --frozen --group dev
+          uv run --project agent --frozen pytest agent/tests/test_opensandbox_integration.py -q
+      - name: Real HTTP and Deep Agents through OpenSandbox
+        run: python scripts/smoke_test.py
+      - name: Check built API service
+        run: |
+          docker compose up -d agent
+          for i in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:8000/healthz; then exit 0; fi
+            sleep 2
+          done
+          exit 1
+      - name: Logs
+        if: always()
+        run: docker compose logs --no-color
+      - name: Stop trusted services
+        if: always()
+        run: docker compose down --volumes
+
+  http-smoke:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

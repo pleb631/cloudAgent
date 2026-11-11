@@ -1,67 +1,45 @@
-# 架构与集成契约
+# 架构
 
 ```text
 OpenAI-compatible client
-  │ Bearer API Key + X-Session-ID
+  │ 用户 API Key + X-Session-ID
   ▼
-Agent service (FastAPI, one process)
-  ├─ API Key → tenant
-  ├─ YAML registry → system prompt / tools / skills / subagents
-  ├─ per-tenant admission + per-session exclusion
-  └─ Official Deep Agents graph (LangGraph)
-       ├─ OpenAI-compatible upstream model
-       ├─ official skills/subagent middleware + scoped todo/load_skill tools
-       └─ execute / file tools: internal HTTP RPC
+Agent (FastAPI，单进程)
+  ├─ 用户 Key → tenant，运行并发与会话互斥
+  ├─ 本地 YAML → system prompt / tools / skills / subagents
+  └─ 官方 Deep Agents (LangGraph)
+       ├─ OpenAI-compatible model
+       ├─ 官方 SkillsMiddleware / SubAgentMiddleware
+       ├─ 请求私有的 StateBackend、todo / load_skill
+       └─ 受限文件/命令工具
             ▼
-Sandbox Manager (separate service, one process)
-  ├─ dedicated internal bearer token
-  ├─ validated operation schema, tenant/session workspace identity
-  └─ Docker daemon
-       └─ constrained sibling execution container + session volume
+官方 OpenSandbox Python SDK
+  ├─ tenant/session → 独立实例，容量限制、短期绑定、TTL续期
+  ├─ 每实例随机 execd Token，不接受用户传入实例ID
+  └─ 官方 OpenSandbox 1.2.0 服务端
+       ├─ 生命周期、存储元数据、认证代理
+       ├─ Docker + 官方 execd
+       └─ 官方 egress (dns+nft)，显式默认deny
 ```
 
-## 服务间 RPC
+`sandbox/` 只维护官方服务端安装与配置、镜像版本和部署测试，没有自建管理HTTP API。`agent/` 中的适配器负责业务身份与工具语义，不自行创建Docker容器或实现execd。
 
-`POST /v1/call`，请求头 `Authorization: Bearer <manager-token>`：
+## 操作映射
 
-```json
-{
-  "tenant_id": "tenant-a",
-  "session_id": "demo",
-  "operation": "write",
-  "arguments": {"path": "report.md", "content": "hello"}
-}
-```
+- read：官方 read_bytes_stream，读取量限制。
+- write：官方 create_directories + write_files。
+- edit：受限读取后精确单次替换，再写回；同会话适配器操作串行。
+- ls：官方 list_directory，返回数量限制。
+- grep：官方文件元数据/列表/读取组合，有限遍历并进行字面文本匹配，不执行用户正则或shell。
+- execute：官方 commands.run、服务端超时、流式输出处理、取消时interrupt。
+- task：官方子智能体中间件，子级权限取交集；不另开租户身份。
 
-操作参数：
+路径只做字面校验，不提供无竞争的符号链接约束。业务文件位于各自实例的 `/workspace`，但该子目录不是安全边界。
 
-| 操作 | 参数 | 行为 |
-| --- | --- | --- |
-| execute | command, timeout（可选） | 在工作区执行 shell 命令，限制时长与输出 |
-| read | path | 读取有大小限制的 UTF-8 文件 |
-| write | path, content | 写入 UTF-8 内容，创建所需父目录 |
-| edit | path, old, new | 精确替换一次；找不到或有歧义时拒绝 |
-| ls | path（默认 `.`） | 有数量上限的目录列表 |
-| grep | pattern, path（默认 `.`） | 有上限的字面字符串搜索，不执行用户正则 |
+## 生命周期和扩展
 
-Manager 不接受任意镜像、挂载点、容器启动参数或宿主机路径。业务请求不能绕过工具白名单，因为 RPC 客户端只被运行时已允许的工具调用。
+会话绑定和配额是进程内的，官方服务端持久化其元数据不等于应用能恢复会话。当前不保存每实例凭据，因此重启后不重新连接旧实例；旧实例最终由TTL回收。没有持久化业务卷。
 
-## 配置和运行状态
+部署示例是Linux Docker宿主机：Agent和官方服务端使用宿主机网络但仅绑定loopback。执行实例加入独立网络命名空间，execd端口只在loopback发布。SDK使用认证服务端代理，不把数据面端口发给最终用户。该代理路径被上游标为维护模式，后续生产扩展应考虑官方Kubernetes ingress gateway。
 
-配置在启动时加载，不支持边运行边热更新。每次请求创建自己的模型消息、graph 状态、todo 和子任务上下文。会话工作区由 Manager 管理，聊天历史由客户端保存。没有 Redis/Postgres 或分布式锁，也没有无限期运行的后台 Agent。
-
-## 扩展方向
-
-1. 引入 Postgres/Redis 做任务状态、会话锁和全局配额。
-2. API 身份接入业务 OIDC，并增加租户对 Agent 和工具的细粒度授权。
-3. 高风险工具加入人工审批、审计与可恢复任务。
-4. 不可信多租户执行迁移到专用节点或 microVM，并加入磁盘、网络与费用配额。
-5. 增加持久化 checkpoint、重试策略、可观测性和工作区生命周期管理。
-
-这些是后续方向，不是当前版本已有功能。
-
-## 官方 Deep Agents 集成边界
-
-运行时通过官方 `deepagents.create_deep_agent` 创建图，不再自行实现 StateGraph 的 model/tools 循环。官方 SubAgentMiddleware 调用配置的子图，SkillsMiddleware 在请求私有的 StateBackend 中发现技能。内存后端仅保存技能与框架临时状态，不把业务文件写入 Agent 主机。业务文件和命令仍经已有 Sandbox Manager RPC。
-
-为保持业务工具白名单，平台关闭框架自动注入的通用文件工具和通用子智能体，再显式注册受限工具。每次模型调用和工具执行均检查允许列表。todo/load_skill 是平台工具，task 由官方中间件提供。对外的 OpenAI 文本/SSE 契约保持不变。
+后续可接入持久化会话/凭据存储、OIDC和Agent级权限、共享配额/锁、审计、人工审批、业务存储和更强的gVisor/Kata/microVM边界。这些不是当前版本已有功能。

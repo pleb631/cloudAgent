@@ -1,20 +1,17 @@
 [project]
-name = "cloudagent-sandbox"
+name = "cloudagent-opensandbox-deployment"
 version = "0.1.0"
 requires-python = ">=3.12"
-dependencies = ["fastapi>=0.115,<1", "uvicorn>=0.30,<1", "pydantic-settings>=2.6,<3", "docker>=7.1,<8"]
-[dependency-groups]
-dev = ["pytest>=8,<10", "httpx>=0.27,<1", "ruff>=0.9,<1"]
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
-[tool.hatch.build.targets.wheel]
-packages = ["src/sandbox_service"]
-[tool.pytest.ini_options]
-pythonpath = ["src"]
+dependencies = ["opensandbox-server==1.2.0"]
 
+[tool.uv]
+package = false
+
+[dependency-groups]
+dev = ["pytest>=8,<10", "ruff>=0.9,<1"]
+
+[tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["docker: opt-in real Docker integration tests"]
 
 [tool.ruff]
 target-version = "py312"
