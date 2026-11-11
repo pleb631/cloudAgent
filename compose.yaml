@@ -1,0 +1,53 @@
+services:
+  agent:
+    build: ./agent
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      CLOUDAGENT_API_KEYS: ${CLOUDAGENT_API_KEYS:?Set CLOUDAGENT_API_KEYS in .env}
+      CLOUDAGENT_LLM_API_KEY: ${CLOUDAGENT_LLM_API_KEY:?Set CLOUDAGENT_LLM_API_KEY in .env}
+      CLOUDAGENT_LLM_BASE_URL: ${CLOUDAGENT_LLM_BASE_URL:-https://api.openai.com/v1}
+      CLOUDAGENT_AGENTS_DIR: /app/agents
+      CLOUDAGENT_SANDBOX_URL: http://sandbox:8001
+      CLOUDAGENT_SANDBOX_TOKEN: ${SANDBOX_TOKEN:?Set SANDBOX_TOKEN in .env}
+    volumes:
+      - ./agent/agents:/app/agents:ro
+    depends_on:
+      sandbox:
+        condition: service_started
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 256
+    mem_limit: 1g
+    cpus: 2
+    restart: unless-stopped
+    networks: [control, outbound]
+
+  sandbox:
+    build: ./sandbox
+    environment:
+      SANDBOX_TOKEN: ${SANDBOX_TOKEN:?Set SANDBOX_TOKEN in .env}
+      SANDBOX_BACKEND: docker
+      SANDBOX_IMAGE: cloudagent-sandbox-runtime:local
+      SANDBOX_MAX_CONCURRENT: 4
+    # This grants daemon control to the trusted Manager only. Never mount in agent/runtime.
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 128
+    mem_limit: 512m
+    cpus: 1
+    restart: unless-stopped
+    networks: [control]
+
+networks:
+  control:
+    internal: true
+  outbound: {}
