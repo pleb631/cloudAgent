@@ -6,6 +6,7 @@ symlink-confined: the dedicated sandbox container is the security boundary.
 """
 
 import asyncio
+import math
 import secrets
 import time
 from contextlib import aclosing
@@ -16,6 +17,7 @@ from pathlib import PurePosixPath
 import httpx
 from opensandbox import Sandbox
 from opensandbox.config import ConnectionConfig
+from opensandbox.exceptions import SandboxApiException
 from opensandbox.models.execd import ExecutionHandlers, RunCommandOpts
 from opensandbox.models.filesystem import DirectoryListEntry, WriteEntry
 from opensandbox.models.sandboxes import NetworkPolicy
@@ -93,8 +95,8 @@ class BoundedSandboxTransport(httpx.AsyncBaseTransport):
 
     async def aclose(self):
         if not self.closed:
-            self.closed = True
             await self.inner.aclose()
+            self.closed = True
 
 
 @dataclass
@@ -104,6 +106,9 @@ class _Session:
     transport: BoundedSandboxTransport
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     users: int = 0
+    killed: bool = False
+    client_closed: bool = False
+    cleanup: asyncio.Task | None = None
 
 
 class OpenSandboxClient:
@@ -116,15 +121,27 @@ class OpenSandboxClient:
         ttl_seconds: int = 600,
         cpu: str = "1",
         memory: str = "512Mi",
-        max_sessions: int = 50,
-        max_sessions_per_tenant: int = 10,
+        max_sessions: int = 4,
+        max_sessions_per_tenant: int = 2,
         protocol: str = "http",
         factory=None,
+        shutdown_timeout: float = 10,
+        cleanup_timeout: float = 2,
+        cleanup_concurrency: int = 8,
     ):
         if not 60 <= ttl_seconds <= 86400 or min(max_sessions, max_sessions_per_tenant) < 1:
             raise ValueError("Invalid sandbox lifetime or capacity")
         if protocol not in {"http", "https"}:
             raise ValueError("Invalid sandbox protocol")
+        if (
+            not all(math.isfinite(t) and t > 0 for t in (shutdown_timeout, cleanup_timeout))
+            or isinstance(cleanup_concurrency, bool)
+            or not isinstance(cleanup_concurrency, int)
+            or cleanup_concurrency < 1
+        ):
+            raise ValueError("Invalid sandbox cleanup limits")
+        self.shutdown_timeout, self.cleanup_timeout = shutdown_timeout, cleanup_timeout
+        self._cleanup_slots = asyncio.Semaphore(cleanup_concurrency)
         self.domain, self.api_key = domain, api_key
         self.image, self.ttl = image, timedelta(seconds=ttl_seconds)
         self.cpu, self.memory, self.protocol = cpu, memory, protocol
@@ -132,7 +149,7 @@ class OpenSandboxClient:
         self.factory = factory or Sandbox.create
         self._sessions: dict[tuple[str, str], _Session] = {}
         self._pending: dict[tuple[str, str], asyncio.Task] = {}
-        self._retiring: set[asyncio.Task] = set()
+        self._retiring: dict[tuple[str, str], _Session] = {}
         self._guard = asyncio.Lock()
         self._closed = False
 
@@ -151,19 +168,42 @@ class OpenSandboxClient:
             raise SandboxError(f"Invalid or oversized {label}")
         return value
 
-    async def _dispose(self, sandbox, transport):
-        # Always attempt both; credentials/errors are never exposed to callers.
-        for method in (sandbox.kill, sandbox.close, transport.aclose):
+    async def _dispose(self, key, entry):
+        # Keep ownership and quota until every phase succeeds. In particular, do
+        # not close the management client after a failed kill: retry needs it.
+        async with self._cleanup_slots, entry.lock:
             try:
-                async with asyncio.timeout(5):
-                    await method()
+                if not entry.killed and entry.sandbox is not None:
+                    try:
+                        async with asyncio.timeout(self.cleanup_timeout):
+                            await entry.sandbox.kill()
+                    except SandboxApiException as exc:
+                        # A prior timed-out deletion (or remote TTL) may have
+                        # already removed this exact sandbox. Other errors do
+                        # not prove termination and must retain ownership.
+                        if exc.status_code != 404:
+                            raise
+                    entry.killed = True
+                if not entry.client_closed and entry.sandbox is not None:
+                    async with asyncio.timeout(self.cleanup_timeout):
+                        await entry.sandbox.close()
+                    entry.client_closed = True
+                async with asyncio.timeout(self.cleanup_timeout):
+                    await entry.transport.aclose()
+                # No await between success and relinquishing ownership.
+                if self._retiring.get(key) is entry:
+                    del self._retiring[key]
             except Exception:
+                # SDK failures may include credentials. The caller gets only a
+                # generic incomplete-cleanup error; the record remains retryable.
                 pass
 
-    def _retire(self, entry):
-        task = asyncio.create_task(self._dispose(entry.sandbox, entry.transport))
-        self._retiring.add(task)
-        task.add_done_callback(self._retiring.discard)
+    def _retire(self, key, entry):
+        self._retiring[key] = entry
+        if entry.cleanup is None or entry.cleanup.done():
+            entry.cleanup = asyncio.create_task(self._dispose(key, entry))
+            entry.cleanup.add_done_callback(lambda t: None if t.cancelled() else t.exception())
+        return entry.cleanup
 
     async def _create(self, key):
         sandbox = None
@@ -202,11 +242,16 @@ class OpenSandboxClient:
                 sandbox = None  # Ownership transferred to session cache.
                 return entry
         finally:
-            if sandbox is not None:
-                await self._dispose(sandbox, transport)
             if not transferred:
-                await transport.aclose()
-            async with self._guard:
+                # Register before awaiting cleanup so interruption cannot lose
+                # a returned remote ID or release its capacity reservation.
+                entry = _Session(sandbox, 0, transport)
+                cleanup = self._retire(key, entry)
+                try:
+                    await asyncio.wait({cleanup}, timeout=3 * self.cleanup_timeout)
+                finally:
+                    self._pending.pop(key, None)
+            else:
                 self._pending.pop(key, None)
 
     async def _get(self, key):
@@ -216,14 +261,24 @@ class OpenSandboxClient:
             for old_key, old in list(self._sessions.items()):
                 if old.users == 0 and old.expires <= time.monotonic():
                     del self._sessions[old_key]
-                    self._retire(old)
+                    self._retire(old_key, old)
+            retiring = [self._retire(k, e) for k, e in list(self._retiring.items())]
+        if retiring:
+            # Retrying expiry disposal is bounded too, even if an SDK method
+            # ignores cancellation. Do not cancel the tracked cleanup workers.
+            await asyncio.wait(retiring, timeout=self.cleanup_timeout)
+        async with self._guard:
+            if self._closed:
+                raise SandboxError("Sandbox client is closed")
             if key in self._sessions:
                 entry = self._sessions[key]
                 entry.users += 1
                 return entry
+            if key in self._retiring:
+                raise SandboxError("Sandbox session cleanup is pending")
             task = self._pending.get(key)
             if task is None:
-                keys = self._sessions.keys() | self._pending.keys()
+                keys = self._sessions.keys() | self._pending.keys() | self._retiring.keys()
                 if (
                     len(keys) >= self.max_sessions
                     or sum(k[0] == key[0] for k in keys) >= self.max_tenant
@@ -233,8 +288,6 @@ class OpenSandboxClient:
                 # Observe failures even when all request waiters were cancelled.
                 task.add_done_callback(lambda t: None if t.cancelled() else t.exception())
                 self._pending[key] = task
-        # Cancellation of a request must not strand a newly created remote container.
-        # Creation continues under bounded deadlines, then is cached or closed.
         entry = await asyncio.shield(task)
         async with self._guard:
             if self._closed:
@@ -275,6 +328,8 @@ class OpenSandboxClient:
                 raise SandboxError("Missing session identity")
             entry = await self._get((tenant_id, session_id))
             async with entry.lock:
+                if self._closed:
+                    raise SandboxError("Sandbox client is closed")
                 async with asyncio.timeout(10):
                     await entry.sandbox.renew(self.ttl)
                 entry.expires = time.monotonic() + self.ttl.total_seconds()
@@ -450,17 +505,25 @@ class OpenSandboxClient:
         return {"matches": matches, "truncated": truncated or bool(queue)}
 
     async def close(self) -> None:
+        """Stop admission and attempt cleanup within one global time budget.
+
+        Caller cancellation never cancels creation or disposal. All unfinished
+        records remain owned and a later close retries failed phases. A hung
+        SDK task is retained, not duplicated, and remote TTL is the final fallback.
+        """
+        deadline = asyncio.get_running_loop().time() + self.shutdown_timeout
         async with self._guard:
             self._closed = True
-            pending = list(self._pending.values())
-        # Do not cancel in-flight creation: retain the returned ID for cleanup.
+            for key, entry in list(self._sessions.items()):
+                self._retire(key, entry)
+                del self._sessions[key]
+            for key, entry in list(self._retiring.items()):
+                self._retire(key, entry)
+            pending = set(self._pending.values())
+            pending.update(e.cleanup for e in self._retiring.values() if e.cleanup is not None)
         if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
-        async with self._guard:
-            sessions = list(self._sessions.values())
-            self._sessions.clear()
-        for entry in sessions:
-            async with entry.lock:
-                await self._dispose(entry.sandbox, entry.transport)
-        if self._retiring:
-            await asyncio.gather(*self._retiring)
+            await asyncio.wait(
+                pending, timeout=max(0, deadline - asyncio.get_running_loop().time())
+            )
+        if self._pending or self._retiring:
+            raise SandboxError("Sandbox cleanup incomplete; retry close")

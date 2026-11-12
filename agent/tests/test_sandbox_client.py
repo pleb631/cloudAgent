@@ -251,9 +251,13 @@ async def test_sdk_errors_redacted_and_failed_setup_cleaned():
     with pytest.raises(SandboxError) as error:
         await c.call("a", "1", "ls", {})
     assert "secret" not in str(error.value).lower()
+    original_kill = f.created[0].kill
     f.created[0].kill = fail
+    with pytest.raises(SandboxError, match="cleanup incomplete"):
+        await c.close()
+    assert f.created[0].closed == 0
+    f.created[0].kill = original_kill
     await c.close()
-    assert f.created[0].closed == 1
 
     async def bad_factory(*args, **kwargs):
         sandbox = await f(*args, **kwargs)
@@ -458,3 +462,249 @@ async def test_transport_closed_when_sdk_create_fails():
     assert captured[0].closed
     assert not c._pending
     await c.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_and_concurrent_close_preserve_cleanup():
+    c, f = client(cleanup_concurrency=1, max_sessions_per_tenant=3)
+    for i in range(3):
+        await c.call("a", str(i), "ls", {})
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = f.created[0].kill
+
+    async def blocked_kill():
+        entered.set()
+        await release.wait()
+        await original()
+
+    f.created[0].kill = blocked_kill
+    first = asyncio.create_task(c.close())
+    await entered.wait()
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    assert len(c._retiring) == 3
+    with pytest.raises(SandboxError, match="closed"):
+        await c.call("new", "1", "ls", {})
+    other = asyncio.create_task(c.close())
+    release.set()
+    await asyncio.gather(other, c.close())
+    await c.close()
+    assert all(s.killed == s.closed == 1 for s in f.created)
+    assert not c._retiring
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["kill", "close", "transport"])
+async def test_failed_cleanup_is_retryable_without_repeating_successful_phases(phase):
+    c, f = client()
+    await c.call("a", "1", "ls", {})
+    entry = c._sessions[("a", "1")]
+    target = entry.transport if phase == "transport" else entry.sandbox
+    name = "aclose" if phase == "transport" else phase
+    original = getattr(target, name)
+
+    async def fail():
+        raise RuntimeError("secret")
+
+    setattr(target, name, fail)
+    with pytest.raises(SandboxError, match="cleanup incomplete"):
+        await c.close()
+    assert c._retiring[("a", "1")] is entry
+    if phase == "kill":
+        assert f.created[0].closed == 0 and not entry.transport.closed
+    setattr(target, name, original)
+    await c.close()
+    await c.close()
+    assert f.created[0].killed == f.created[0].closed == 1
+    assert entry.transport.closed
+
+
+@pytest.mark.asyncio
+async def test_shutdown_budget_bounds_many_hung_cleanup_tasks_and_concurrency():
+    c, f = client(
+        max_sessions=20,
+        max_sessions_per_tenant=20,
+        shutdown_timeout=0.03,
+        cleanup_timeout=0.02,
+        cleanup_concurrency=2,
+    )
+    for i in range(12):
+        await c.call("a", str(i), "ls", {})
+    active = peak = 0
+    release = asyncio.Event()
+
+    async def stubborn_kill():
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        try:
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                await release.wait()
+        finally:
+            active -= 1
+
+    for sandbox in f.created:
+        sandbox.kill = stubborn_kill
+    start = asyncio.get_running_loop().time()
+    with pytest.raises(SandboxError, match="cleanup incomplete"):
+        await c.close()
+    assert asyncio.get_running_loop().time() - start < 0.2
+    assert len(c._retiring) == 12 and peak == 2
+    release.set()
+    await c.close()
+    assert not c._retiring
+    assert all(s.closed == 1 for s in f.created)
+
+
+@pytest.mark.asyncio
+async def test_failed_expiry_does_not_release_quota():
+    c, f = client(max_sessions=1)
+    await c.call("a", "1", "ls", {})
+    c._sessions[("a", "1")].expires = 0
+    original = f.created[0].kill
+
+    async def fail():
+        raise RuntimeError("secret")
+
+    f.created[0].kill = fail
+    with pytest.raises(SandboxError, match="capacity"):
+        await c.call("b", "1", "ls", {})
+    assert len(f.created) == 1 and ("a", "1") in c._retiring
+    f.created[0].kill = original
+    await c.call("b", "1", "ls", {})
+    await c.close()
+
+
+@pytest.mark.asyncio
+async def test_close_during_creation_is_bounded_and_keeps_returned_id():
+    c, f = client(shutdown_timeout=0.02)
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def slow_factory(*args, **kwargs):
+        entered.set()
+        await release.wait()
+        return await f(*args, **kwargs)
+
+    c.factory = slow_factory
+    request = asyncio.create_task(c.call("a", "1", "ls", {}))
+    await entered.wait()
+    with pytest.raises(SandboxError, match="cleanup incomplete"):
+        await c.close()
+    assert c._pending and not f.created
+    release.set()
+    with pytest.raises(SandboxError, match="closed"):
+        await request
+    await c.close()
+    assert f.created[0].killed == f.created[0].closed == 1
+
+
+@pytest.mark.asyncio
+async def test_transport_close_failure_does_not_mark_closed():
+    from cloudagent.sandbox_client import BoundedSandboxTransport
+
+    class FlakyTransport(httpx.AsyncBaseTransport):
+        calls = 0
+
+        async def aclose(self):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("retry")
+
+    inner = FlakyTransport()
+    transport = BoundedSandboxTransport(inner)
+    with pytest.raises(RuntimeError):
+        await transport.aclose()
+    assert not transport.closed
+    await transport.aclose()
+    await transport.aclose()
+    assert transport.closed and inner.calls == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["kill", "close", "transport"])
+async def test_cleanup_phase_timeout_preserves_retry(phase):
+    c, f = client(cleanup_timeout=0.01)
+    await c.call("a", "1", "ls", {})
+    entry = c._sessions[("a", "1")]
+    target = entry.transport if phase == "transport" else entry.sandbox
+    name = "aclose" if phase == "transport" else phase
+    original = getattr(target, name)
+
+    async def hang():
+        await asyncio.Event().wait()
+
+    setattr(target, name, hang)
+    with pytest.raises(SandboxError, match="cleanup incomplete"):
+        await c.close()
+    assert c._retiring[("a", "1")] is entry
+    setattr(target, name, original)
+    await c.close()
+    assert f.created[0].killed == f.created[0].closed == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_setup_and_failed_kill_keep_capacity_reserved():
+    c, f = client(max_sessions=1)
+
+    async def fail(*args, **kwargs):
+        raise RuntimeError("secret")
+
+    async def factory(*args, **kwargs):
+        sandbox = await f(*args, **kwargs)
+        sandbox.files.create_directories = fail
+        sandbox.kill = fail
+        return sandbox
+
+    c.factory = factory
+    with pytest.raises(SandboxError):
+        await c.call("a", "1", "ls", {})
+    assert not c._pending and ("a", "1") in c._retiring
+    with pytest.raises(SandboxError, match="capacity"):
+        await c.call("b", "1", "ls", {})
+    f.created[0].kill = FakeSandbox.kill.__get__(f.created[0])
+    await c.close()
+
+
+@pytest.mark.asyncio
+async def test_close_waits_for_active_operation_without_early_disposal():
+    c, f = client(shutdown_timeout=0.01)
+    await c.call("a", "1", "ls", {})
+    entry = c._sessions[("a", "1")]
+    await entry.lock.acquire()
+    request = asyncio.create_task(c.call("a", "1", "ls", {}))
+    await asyncio.sleep(0)
+    with pytest.raises(SandboxError, match="cleanup incomplete"):
+        await c.close()
+    assert f.created[0].killed == 0
+    entry.lock.release()
+    with pytest.raises(SandboxError, match="closed"):
+        await request
+    await c.close()
+    assert f.created[0].killed == f.created[0].closed == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [404, 403, 500])
+async def test_kill_retry_accepts_only_remote_not_found(status):
+    from opensandbox.exceptions import SandboxApiException
+
+    c, f = client()
+    await c.call("a", "1", "ls", {})
+    original = f.created[0].kill
+
+    async def missing():
+        raise SandboxApiException(status_code=status)
+
+    f.created[0].kill = missing
+    if status == 404:
+        await c.close()
+        assert not c._retiring and f.created[0].closed == 1
+    else:
+        with pytest.raises(SandboxError, match="cleanup incomplete"):
+            await c.close()
+        assert c._retiring and f.created[0].closed == 0
+        f.created[0].kill = original
+        await c.close()
