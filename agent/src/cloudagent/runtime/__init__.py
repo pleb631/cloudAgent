@@ -5,6 +5,7 @@ from .engine import (
     AgentRuntimeError,
     IterationLimitError,
     ProviderError,
+    ResourceLimitError,
     ToolExecutionError,
 )
 
@@ -13,5 +14,6 @@ __all__ = [
     "AgentRuntimeError",
     "IterationLimitError",
     "ProviderError",
+    "ResourceLimitError",
     "ToolExecutionError",
 ]

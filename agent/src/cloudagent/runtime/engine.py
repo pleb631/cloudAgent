@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import json
 from collections.abc import AsyncIterator, Callable
+from dataclasses import dataclass, field
 from typing import Any
 
 import yaml
@@ -13,8 +14,12 @@ from deepagents.backends.utils import create_file_data
 from deepagents.middleware.filesystem import FilesystemMiddleware
 from deepagents.middleware.skills import SkillsMiddleware
 from deepagents.middleware.subagents import SubAgentMiddleware
+from deepagents.middleware.summarization import (
+    DEEPAGENTS_DEFAULT_SUMMARY_PROMPT,
+    create_summarization_middleware,
+)
 from langchain.agents.middleware import AgentMiddleware
-from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, get_buffer_string
 from langchain_core.runnables import RunnableLambda
 from langchain_core.tools import StructuredTool
 from langchain_openai import ChatOpenAI
@@ -36,6 +41,115 @@ class ToolExecutionError(AgentRuntimeError):
 
 class IterationLimitError(AgentRuntimeError):
     pass
+
+
+class ResourceLimitError(AgentRuntimeError):
+    pass
+
+
+@dataclass
+class RunBudget:
+    """One cumulative budget shared by every descendant of a root invocation.
+
+    Claims have no await point, so sibling tasks cannot oversubscribe the budget
+    on the single event loop. Cancelled/failed work does not refund its claim.
+    """
+
+    model_calls_left: int
+    children_left: int
+    operation_tasks: set[asyncio.Task] = field(default_factory=set)
+    closed: bool = False
+
+    def claim_model(self):
+        if self.model_calls_left <= 0:
+            raise ResourceLimitError("Run model call budget exhausted.")
+        self.model_calls_left -= 1
+
+    def claim_child(self):
+        if self.children_left <= 0:
+            raise ResourceLimitError("Run subagent budget exhausted.")
+        self.children_left -= 1
+
+    @staticmethod
+    async def _join(tasks):
+        # Keep cleanup owned even if another cancellation arrives while joining.
+        # Shield prevents cancellation propagating twice into an SDK finally block.
+        waiter = asyncio.gather(*tasks, return_exceptions=True)
+        cancelled = False
+        while not waiter.done():
+            try:
+                await asyncio.shield(waiter)
+            except asyncio.CancelledError:
+                cancelled = True
+        if cancelled:
+            raise asyncio.CancelledError
+
+    async def run_owned(self, operation):
+        if self.closed:
+            raise asyncio.CancelledError
+        task = asyncio.create_task(operation())
+        self.operation_tasks.add(task)
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if not task.done() and not task.cancelling():
+                task.cancel()
+            await self._join([task])
+            raise
+        finally:
+            if task.done():
+                self.operation_tasks.discard(task)
+
+    async def stop(self):
+        # ToolNode's gather propagates a sibling error without stopping the rest.
+        # Own every actual model/tool operation, not just subagents, so no
+        # command or provider work survives the terminal event/session lease.
+        self.closed = True
+        tasks = list(self.operation_tasks)
+        for task in tasks:
+            if not task.done() and not task.cancelling():
+                task.cancel()
+        try:
+            await self._join(tasks)
+        finally:
+            self.operation_tasks.difference_update(task for task in tasks if task.done())
+
+
+class ModelCallLimits:
+    """Atomic global/tenant admission across all root and nested model calls.
+
+    Bookkeeping does not suspend, including release during cancellation. Waiting
+    calls hold neither a global nor a tenant slot, avoiding nested semaphore
+    starvation. This is process-local, like root-run admission control.
+    """
+
+    def __init__(self, total: int, per_tenant: int):
+        self.total, self.per_tenant = total, per_tenant
+        self.active = 0
+        self.tenants: dict[str, int] = {}
+        self.waiters: set[asyncio.Future] = set()
+
+    @contextlib.asynccontextmanager
+    async def slot(self, tenant: str):
+        while self.active >= self.total or self.tenants.get(tenant, 0) >= self.per_tenant:
+            waiter = asyncio.get_running_loop().create_future()
+            self.waiters.add(waiter)
+            try:
+                await waiter
+            finally:
+                self.waiters.discard(waiter)
+        self.active += 1
+        self.tenants[tenant] = self.tenants.get(tenant, 0) + 1
+        try:
+            yield
+        finally:
+            self.active -= 1
+            self.tenants[tenant] -= 1
+            if not self.tenants[tenant]:
+                del self.tenants[tenant]
+            for waiter in self.waiters:
+                if not waiter.done():
+                    waiter.set_result(None)
 
 
 # Schemas are also used to validate model-generated arguments before execution.
@@ -137,12 +251,23 @@ class AgentRuntime:
         llm_api_key: str | None = None,
         request_timeout: float = 120,
         max_subagent_depth: int = 3,
+        max_concurrent_model_calls: int = 8,
+        max_model_calls_per_tenant: int = 4,
+        max_model_calls_per_run: int = 64,
+        max_subagent_invocations_per_run: int = 32,
     ):
+        if min(max_concurrent_model_calls, max_model_calls_per_tenant, max_model_calls_per_run) < 1:
+            raise ValueError("Model limits must be positive")
+        if max_subagent_invocations_per_run < 0:
+            raise ValueError("Subagent budget must be nonnegative")
         self.registry, self.sandbox = registry, sandbox
         self.model_factory = model_factory
         self.llm_base_url, self.llm_api_key = llm_base_url, llm_api_key
         self.request_timeout = request_timeout
         self.max_subagent_depth = max_subagent_depth
+        self.model_limits = ModelCallLimits(max_concurrent_model_calls, max_model_calls_per_tenant)
+        self.max_model_calls_per_run = max_model_calls_per_run
+        self.max_subagent_invocations_per_run = max_subagent_invocations_per_run
 
     async def stream(
         self, messages: list[dict], agent_id: str, tenant_id: str, session_id: str
@@ -150,10 +275,17 @@ class AgentRuntime:
         # A bounded queue provides backpressure when an SSE consumer is slow.
         queue: asyncio.Queue = asyncio.Queue(maxsize=64)
         sentinel = object()
+        budget = RunBudget(self.max_model_calls_per_run, self.max_subagent_invocations_per_run)
 
         async def produce():
             try:
-                await self._run(messages, agent_id, tenant_id, session_id, queue.put)
+                try:
+                    await self._run(
+                        messages, agent_id, tenant_id, session_id, queue.put, budget=budget
+                    )
+                finally:
+                    # Complete cancellation before publishing any terminal event.
+                    await budget.stop()
             except asyncio.CancelledError:
                 raise
             except AgentRuntimeError as exc:
@@ -189,7 +321,10 @@ class AgentRuntime:
         depth=0,
         parent_tools=None,
         parent_skills=None,
+        budget: RunBudget | None = None,
     ):
+        if budget is None:
+            budget = RunBudget(self.max_model_calls_per_run, self.max_subagent_invocations_per_run)
         if depth > self.max_subagent_depth:
             raise ToolExecutionError("Subagent depth limit reached.")
         try:
@@ -231,7 +366,9 @@ class AgentRuntime:
                     base_url=self.llm_base_url,
                     api_key=self.llm_api_key,
                     timeout=self.request_timeout,
-                    max_retries=1,
+                    # Each admitted call is at most one provider request. Retry
+                    # inside the SDK would bypass the cumulative run budget.
+                    max_retries=0,
                     stream_usage=True,
                     use_responses_api=False,
                 )
@@ -284,6 +421,47 @@ class AgentRuntime:
         iterations = 0
         runtime = self
 
+        @contextlib.asynccontextmanager
+        async def model_call():
+            budget.claim_model()
+            async with asyncio.timeout(runtime.request_timeout):
+                async with runtime.model_limits.slot(tenant_id):
+                    yield
+
+        async def summarize(messages):
+            # Official auto-compaction calls a model outside PolicyMiddleware.
+            # Use its public summarizer hook so this hidden work cannot bypass
+            # tenant concurrency, the root budget, or the request timeout.
+            prompt = DEEPAGENTS_DEFAULT_SUMMARY_PROMPT.format(
+                messages=get_buffer_string(messages, format="xml")
+            ).rstrip()
+
+            async def generate():
+                parts = []
+                try:
+                    async with model_call():
+                        async with contextlib.aclosing(model.astream(prompt)) as stream:
+                            async for chunk in stream:
+                                parts.append(chunk.text)
+                                usage = chunk.usage_metadata
+                                if usage:
+                                    await emit(
+                                        {
+                                            "type": "usage",
+                                            "prompt_tokens": usage.get("input_tokens", 0),
+                                            "completion_tokens": usage.get("output_tokens", 0),
+                                        }
+                                    )
+                except asyncio.CancelledError:
+                    raise
+                except AgentRuntimeError:
+                    raise
+                except Exception:
+                    raise ProviderError("Model summary request failed.") from None
+                return "".join(parts)
+
+            return await budget.run_owned(generate)
+
         class PolicyMiddleware(AgentMiddleware):
             async def awrap_model_call(self, request, handler):
                 nonlocal iterations
@@ -295,15 +473,19 @@ class AgentRuntime:
                     for tool in request.tools
                     if (tool.get("name") if isinstance(tool, dict) else tool.name) in allowed
                 ]
-                try:
-                    async with asyncio.timeout(runtime.request_timeout):
-                        result = await handler(request.override(tools=filtered))
-                except asyncio.CancelledError:
-                    raise
-                except AgentRuntimeError:
-                    raise
-                except Exception:
-                    raise ProviderError("Model request failed.") from None
+
+                async def invoke():
+                    try:
+                        async with model_call():
+                            return await handler(request.override(tools=filtered))
+                    except asyncio.CancelledError:
+                        raise
+                    except AgentRuntimeError:
+                        raise
+                    except Exception:
+                        raise ProviderError("Model request failed.") from None
+
+                result = await budget.run_owned(invoke)
                 # Validate the entire response before executing ANY call. This also
                 # blocks middleware-injected aliases which the provider invents.
                 response = result.model_response if hasattr(result, "model_response") else result
@@ -319,17 +501,24 @@ class AgentRuntime:
                 return result
 
             async def awrap_tool_call(self, request, handler):
-                check_call(request.tool_call)
-                name = request.tool_call["name"]
-                await emit(
-                    {"type": "tool_start", "name": name, "agent_id": agent_id, "depth": depth}
-                )
-                result = await handler(request)
-                await emit({"type": "tool_end", "name": name, "agent_id": agent_id, "depth": depth})
-                return result
+                async def operation():
+                    check_call(request.tool_call)
+                    name = request.tool_call["name"]
+                    await emit(
+                        {"type": "tool_start", "name": name, "agent_id": agent_id, "depth": depth}
+                    )
+                    result = await handler(request)
+                    await emit(
+                        {"type": "tool_end", "name": name, "agent_id": agent_id, "depth": depth}
+                    )
+                    return result
+
+                return await budget.run_owned(operation)
 
         def make_child(child_id):
             async def run_child(state):
+                budget.claim_child()
+
                 async def child_emit(event):
                     if event["type"] != "token":
                         await emit(event)
@@ -343,6 +532,7 @@ class AgentRuntime:
                     depth + 1,
                     allowed,
                     set(skills),
+                    budget,
                 )
                 # Do not return scratch files, todos or metadata to the parent.
                 return {"messages": [AIMessage(content=answer)]}
@@ -380,6 +570,7 @@ class AgentRuntime:
                 human_message_token_limit_before_evict=None,
             ),
             subagent_middleware,
+            create_summarization_middleware(model, backend, summarizer=summarize),
             PolicyMiddleware(),
         ]
         files = {}
@@ -426,47 +617,51 @@ class AgentRuntime:
             raise ProviderError("Agent initialization failed.") from None
         final = None
         try:
-            async for mode, data in graph.astream(
-                {"messages": history, "files": files},
-                config={
-                    "recursion_limit": max(32, config.max_iterations * 10 + 20),
-                    "metadata": {"cloudagent_depth": depth},
-                },
-                stream_mode=["messages", "values"],
-            ):
-                if mode == "values":
-                    final = data
-                    continue
-                chunk, metadata = data
-                # Exclude compaction and nested child model streams. Child usage
-                # and tool lifecycle are forwarded explicitly by child_emit.
-                if (
-                    metadata.get("langgraph_node") != "model"
-                    or metadata.get("cloudagent_depth") != depth
-                ):
-                    continue
-                if not isinstance(chunk, (AIMessage, AIMessageChunk)):
-                    continue
-                text = chunk.content
-                if isinstance(text, list):
-                    text = "".join(
-                        part.get("text", "")
-                        for part in text
-                        if isinstance(part, dict) and part.get("type") == "text"
-                    )
-                if text:
-                    await emit(
-                        {"type": "token", "text": text, "agent_id": agent_id, "depth": depth}
-                    )
-                usage = getattr(chunk, "usage_metadata", None)
-                if usage:
-                    await emit(
-                        {
-                            "type": "usage",
-                            "prompt_tokens": usage.get("input_tokens", 0),
-                            "completion_tokens": usage.get("output_tokens", 0),
-                        }
-                    )
+            async with contextlib.aclosing(
+                graph.astream(
+                    {"messages": history, "files": files},
+                    config={
+                        "recursion_limit": max(32, config.max_iterations * 10 + 20),
+                        "metadata": {"cloudagent_depth": depth},
+                    },
+                    stream_mode=["messages", "values"],
+                )
+            ) as stream:
+                async for mode, data in stream:
+                    if mode == "values":
+                        final = data
+                        continue
+                    chunk, metadata = data
+                    # Exclude compaction and nested child model streams. Child usage
+                    # and tool lifecycle are forwarded explicitly by child_emit.
+                    if (
+                        metadata.get("langgraph_node") != "model"
+                        or metadata.get("cloudagent_depth") != depth
+                        or metadata.get("lc_source") == "summarization"
+                    ):
+                        continue
+                    if not isinstance(chunk, (AIMessage, AIMessageChunk)):
+                        continue
+                    text = chunk.content
+                    if isinstance(text, list):
+                        text = "".join(
+                            part.get("text", "")
+                            for part in text
+                            if isinstance(part, dict) and part.get("type") == "text"
+                        )
+                    if text:
+                        await emit(
+                            {"type": "token", "text": text, "agent_id": agent_id, "depth": depth}
+                        )
+                    usage = getattr(chunk, "usage_metadata", None)
+                    if usage:
+                        await emit(
+                            {
+                                "type": "usage",
+                                "prompt_tokens": usage.get("input_tokens", 0),
+                                "completion_tokens": usage.get("output_tokens", 0),
+                            }
+                        )
         except asyncio.CancelledError:
             raise
         except AgentRuntimeError:

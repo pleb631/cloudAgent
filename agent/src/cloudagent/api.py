@@ -6,13 +6,14 @@ import json
 import logging
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import aclosing, asynccontextmanager
 from typing import Annotated, Literal
 
+import anyio
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
-from starlette.background import BackgroundTask
+from starlette.requests import ClientDisconnect
 
 from cloudagent.config import AgentRegistry, Settings
 from cloudagent.sandbox_client import OpenSandboxClient
@@ -74,6 +75,67 @@ class RunLimits:
                     self.active.discard(key)
 
         return release
+
+
+async def finish_request(tasks, release, iterator=None):
+    """Join runtime cleanup before returning its admission lease.
+
+    A timeout may already have cancelled the runtime. Do not cancel it again
+    while it is awaiting its finally blocks. A separate shielded cleanup task
+    also defers repeated explicit request cancellation until cleanup finishes.
+    """
+
+    async def cleanup():
+        try:
+            for task in tasks:
+                if not task.done() and not task.cancelling():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            if iterator is not None:
+                await iterator.aclose()
+        finally:
+            await release()
+
+    cleanup_task = asyncio.create_task(cleanup())
+    cancelled = False
+    with anyio.CancelScope(shield=True):
+        while not cleanup_task.done():
+            try:
+                await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError:
+                cancelled = True
+        cleanup_task.result()
+    if cancelled:
+        raise asyncio.CancelledError
+
+
+class ManagedStreamingResponse(StreamingResponse):
+    """Own the iterator and admission lease, even when ASGI send fails.
+
+    Background tasks are not guaranteed to run after disconnects. Explicitly close
+    the entire iterator chain before releasing admission, without relying on GC.
+    """
+
+    def __init__(self, content, *, release, **kwargs):
+        super().__init__(content, **kwargs)
+        self.release = release
+
+    async def __call__(self, scope, receive, send):
+        # Use edge-triggered asyncio cancellation rather than the repeated
+        # cancellation of Starlette's legacy AnyIO task group: runtime finally
+        # blocks must be able to await cleanup after receiving CancelledError.
+        stream = asyncio.create_task(self.stream_response(send))
+        disconnect = asyncio.create_task(self.listen_for_disconnect(receive))
+        try:
+            done, _ = await asyncio.wait((stream, disconnect), return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                task.result()
+        except OSError as exc:
+            raise ClientDisconnect() from exc
+        finally:
+            await finish_request((stream, disconnect), self.release, self.body_iterator)
+        if self.background is not None:
+            await self.background()
 
 
 class BodyLimitMiddleware:
@@ -155,6 +217,10 @@ def create_app(
                 llm_base_url=settings.llm_base_url,
                 llm_api_key=settings.llm_api_key.get_secret_value(),
                 request_timeout=settings.request_timeout,
+                max_concurrent_model_calls=settings.max_concurrent_model_calls,
+                max_model_calls_per_tenant=settings.max_model_calls_per_tenant,
+                max_model_calls_per_run=settings.max_model_calls_per_run,
+                max_subagent_invocations_per_run=settings.max_subagent_invocations_per_run,
             )
         else:
             app.state.runtime = runtime
@@ -239,13 +305,18 @@ def create_app(
             return "data: " + json.dumps(result, ensure_ascii=False) + "\n\n"
 
         async def events():
-            async with asyncio.timeout(settings.run_timeout):
-                async for event in request.app.state.runtime.stream(
-                    [message.model_dump() for message in body.messages],
-                    body.model,
-                    identity,
-                    session,
-                ):
+            async with (
+                asyncio.timeout(settings.run_timeout),
+                aclosing(
+                    request.app.state.runtime.stream(
+                        [message.model_dump() for message in body.messages],
+                        body.model,
+                        identity,
+                        session,
+                    )
+                ) as stream,
+            ):
+                async for event in stream:
                     if event["type"] == "usage":
                         usage["prompt_tokens"] += event.get("prompt_tokens", 0)
                         usage["completion_tokens"] += event.get("completion_tokens", 0)
@@ -255,9 +326,10 @@ def create_app(
         async def sse():
             try:
                 yield chunk({"role": "assistant"})
-                async for event in events():
-                    if event["type"] == "token" and event.get("text"):
-                        yield chunk({"content": event["text"]})
+                async with aclosing(events()) as stream:
+                    async for event in stream:
+                        if event["type"] == "token" and event.get("text"):
+                            yield chunk({"content": event["text"]})
                 yield chunk(finish="stop")
                 if body.stream_options and body.stream_options.include_usage:
                     yield chunk(usage_only=True)
@@ -266,22 +338,40 @@ def create_app(
             except Exception as exc:
                 logger.warning("Agent run failed: %s", type(exc).__name__)
                 yield 'data: {"error":{"message":"Agent run failed; check service logs and provider availability","type":"server_error","code":"run_failed"}}\n\n'
-            finally:
-                await release()
             yield "data: [DONE]\n\n"
 
         if body.stream:
-            return StreamingResponse(
+            return ManagedStreamingResponse(
                 sse(),
                 media_type="text/event-stream",
                 headers=headers,
-                background=BackgroundTask(release),
+                release=release,
             )
-        try:
+
+        async def collect():
             text = []
-            async for event in events():
-                if event["type"] == "token":
-                    text.append(event["text"])
+            async with aclosing(events()) as stream:
+                async for event in stream:
+                    if event["type"] == "token":
+                        text.append(event["text"])
+            return text
+
+        async def disconnected():
+            # The request body has already been consumed by FastAPI. Only this
+            # task reads receive while the nonstreaming run is in progress.
+            while (await request.receive())["type"] != "http.disconnect":
+                pass
+
+        run = asyncio.create_task(collect())
+        disconnect = asyncio.create_task(disconnected())
+        try:
+            done, _ = await asyncio.wait((run, disconnect), return_when=asyncio.FIRST_COMPLETED)
+            if disconnect in done:
+                disconnect.result()
+                # There is no peer left to receive this response. Returning keeps
+                # a normal disconnect out of the server's exception logs.
+                return Response(status_code=499)
+            text = run.result()
             return JSONResponse(
                 {
                     "id": completion_id,
@@ -309,7 +399,7 @@ def create_app(
                 502, "Agent run failed; check service logs and provider availability"
             ) from None
         finally:
-            await release()
+            await finish_request((run, disconnect), release)
 
     return app
 

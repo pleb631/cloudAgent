@@ -39,3 +39,30 @@ def test_keys_and_no_agents(tmp_path):
 def test_skill_names_cannot_inject_virtual_paths():
     with pytest.raises(ValueError):
         AgentConfig(id="a", system_prompt="hello", skills={"../../escape": "bad"})
+
+
+@pytest.mark.parametrize(
+    "name,value",
+    [
+        ("max_concurrent_model_calls", 0),
+        ("max_model_calls_per_tenant", 0),
+        ("max_model_calls_per_run", 0),
+        ("max_subagent_invocations_per_run", -1),
+        ("max_subagent_invocations_per_run", 10001),
+    ],
+)
+def test_model_resource_limits_are_validated(name, value):
+    with pytest.raises(ValueError):
+        Settings(**{name: value})
+
+
+def test_model_resource_limits_load_from_environment(monkeypatch):
+    monkeypatch.setenv("CLOUDAGENT_MAX_CONCURRENT_MODEL_CALLS", "3")
+    monkeypatch.setenv("CLOUDAGENT_MAX_MODEL_CALLS_PER_TENANT", "2")
+    monkeypatch.setenv("CLOUDAGENT_MAX_MODEL_CALLS_PER_RUN", "12")
+    monkeypatch.setenv("CLOUDAGENT_MAX_SUBAGENT_INVOCATIONS_PER_RUN", "0")
+    settings = Settings(_env_file=None)
+    assert settings.max_concurrent_model_calls == 3
+    assert settings.max_model_calls_per_tenant == 2
+    assert settings.max_model_calls_per_run == 12
+    assert settings.max_subagent_invocations_per_run == 0
