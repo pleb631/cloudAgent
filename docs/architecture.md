@@ -1,45 +1,29 @@
-# 架构
+# OpenHands 单主机架构
+
+本分支只有 OpenHands 实现，不运行 Deep Agents 或 OpenSandbox 服务。
 
 ```text
-OpenAI-compatible client
-  │ 用户 API Key + X-Session-ID
-  ▼
-Agent (FastAPI，单进程)
-  ├─ 用户 Key → tenant，运行并发与会话互斥
-  ├─ 本地 YAML → system prompt / tools / skills / subagents
-  └─ 官方 Deep Agents (LangGraph)
-       ├─ OpenAI-compatible model
-       ├─ 官方 SkillsMiddleware / SubAgentMiddleware
-       ├─ 请求私有的 StateBackend、todo / load_skill
-       └─ 受限文件/命令工具
-            ▼
-官方 OpenSandbox Python SDK
-  ├─ tenant/session → 独立实例，容量限制、短期绑定、TTL续期
-  ├─ 每实例随机 execd Token，不接受用户传入实例ID
-  └─ 官方 OpenSandbox 1.2.0 服务端
-       ├─ 生命周期、存储元数据、认证代理
-       ├─ Docker + 官方 execd
-       └─ 官方 egress (dns+nft)，显式默认deny
+HTTP 客户端 → FastAPI（Bearer Key → 租户、请求校验、并发准入）
+                    ↓
+       OpenHands SDK / RemoteConversation
+                    ↓
+   每请求独立的 agent-server Docker 容器
+   官方模型循环 / 工具 / 技能 / 叶子子智能体
+                    ↓
+       /workspace → 预配置租户宿主机目录（读写）
 ```
 
-`sandbox/` 只维护官方服务端安装与配置、镜像版本和部署测试，没有自建管理HTTP API。`agent/` 中的适配器负责业务身份与工具语义，不自行创建Docker容器或实现execd。
+控制器通过 Docker SDK 薄生命周期层创建和销毁容器，通过官方 RemoteWorkspace 与 agent-server 通信。没有另写 Agent 推理循环。选择薄生命周期层是为显式设置 CPU、内存、PID 限制，而不是去除沙箱。
 
-## 操作映射
+- `openhands/src/cloudagent_oh/api.py`：OpenAI 文本子集、SSE、鉴权和请求准入。
+- `config.py`：受信任 YAML、提示词、技能、工具及子 Agent 配置；服务端租户目录映射。
+- `runtime.py`：官方 SDK 转换、每请求容器、取消/超时和资源回收。
+- `openhands/server/`：固定 SDK 版本的配置策略入口，关闭工作区自动插件和文件子 Agent 发现。
 
-- read：官方 read_bytes_stream，读取量限制。
-- write：官方 create_directories + write_files。
-- edit：受限读取后精确单次替换，再写回；同会话适配器操作串行。
-- ls：官方 list_directory，返回数量限制。
-- grep：官方文件元数据/列表/读取组合，有限遍历并进行字面文本匹配，不执行用户正则或shell。
-- execute：官方 commands.run、服务端超时、流式输出处理、取消时interrupt。
-- task：官方子智能体中间件，子级权限取交集；不另开租户身份。
+控制器只读挂载数据父目录以校验路径；每个执行容器只读写挂载对应租户根目录。终端用户不能选择任意宿主路径。Docker socket 不进入执行容器。
 
-路径只做字面校验，不提供无竞争的符号链接约束。业务文件位于各自实例的 `/workspace`，但该子目录不是安全边界。
+同租户并发返回 409，全局请求限额返回 429。仅支持一个控制器实例和一个 worker；进程锁不是分布式锁。每次请求创建新 Conversation，复用 session ID 不会恢复历史。
 
-## 生命周期和扩展
+文件改动立即持久化；取消只终止运行和回收容器，不撤销写入。清理失败保留占额并重试，启动时回收同部署标签的孤儿容器；控制器不再启动时需运维处理残留。
 
-会话绑定和配额是进程内的，官方服务端持久化其元数据不等于应用能恢复会话。当前不保存每实例凭据，因此重启后不重新连接旧实例；旧实例最终由TTL回收。没有持久化业务卷。
-
-部署示例是Linux Docker宿主机：Agent和官方服务端使用宿主机网络但仅绑定loopback。执行实例加入独立网络命名空间，execd端口只在loopback发布。SDK使用认证服务端代理，不把数据面端口发给最终用户。该代理路径被上游标为维护模式，后续生产扩展应考虑官方Kubernetes ingress gateway。
-
-后续可接入持久化会话/凭据存储、OIDC和Agent级权限、共享配额/锁、审计、人工审批、业务存储和更强的gVisor/Kata/microVM边界。这些不是当前版本已有功能。
+完整接口、启动和配置示例见 [OpenHands README](../openhands/README.md)。

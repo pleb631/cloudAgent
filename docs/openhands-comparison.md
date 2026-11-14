@@ -1,6 +1,6 @@
 # OpenHands 方案与现有方案
 
-本分支新增独立的 `openhands/` 包和 `compose.openhands.yaml`，不替换现有 `agent/`、`sandbox/`、`compose.yaml`。原方案继续使用官方 Deep Agents + OpenSandbox；新增方案使用官方 OpenHands Software Agent SDK、Tools 和 agent-server **1.62.0**。
+本分支仅保留 `openhands/` 实现，并由根目录 `compose.yaml` 默认部署。Deep Agents + OpenSandbox 的代码、依赖、部署和测试已移出本分支，原方案仍保留在 [main 分支](https://github.com/pleb631/cloudAgent/tree/main)。下表是与主分支原方案的架构对照，不表示本分支同时运行两套框架。OpenHands 方案使用官方 Software Agent SDK、Tools 和 agent-server **1.62.0**。
 
 这里接入的是 **Software Agent SDK**，不是部署完整 OpenHands 产品。它不自带完整产品的登录、项目管理、Web UI、计费或长期会话管理。
 

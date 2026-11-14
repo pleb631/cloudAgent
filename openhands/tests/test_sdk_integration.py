@@ -412,18 +412,17 @@ async def test_docker_runtime_real_mount_usage_and_cleanup(tmp_path):
         )
 
         class DiagnosticRuntime(OpenHandsRuntime):
-            async def _healthy(self, host):
+            async def _dispose_locked(self, run):
+                # Only fake credentials are used here; collect diagnostics even if
+                # the entrypoint exits before Docker exposes a port mapping.
                 try:
-                    await super()._healthy(host)
-                except Exception:
-                    # This test uses only fake credentials and a disposable workspace.
-                    # Capture before stream's finally block removes the container.
-                    for run in self.runs.values():
-                        if run.container is not None:
-                            run.container.reload()
-                            print("Container startup state:", run.container.attrs.get("State"))
-                            print(run.container.logs(tail=100).decode(errors="replace"))
-                    raise
+                    if run.container is not None:
+                        run.container.reload()
+                        print("Container startup state:", run.container.attrs.get("State"))
+                        print(run.container.logs(tail=100).decode(errors="replace"))
+                except Exception as exc:
+                    print("Could not collect startup diagnostics:", type(exc).__name__)
+                return await super()._dispose_locked(run)
 
         runtime = DiagnosticRuntime(settings, AgentRegistry([config]), docker_client=client)
         try:

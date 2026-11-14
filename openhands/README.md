@@ -1,6 +1,6 @@
 # cloudAgent：OpenHands 独立方案
 
-基于官方 **OpenHands Software Agent SDK / Tools / agent-server 1.62.0** 的配置驱动业务 Agent API。与现有 Deep Agents + OpenSandbox 方案并存，不替换根目录的默认部署。
+基于官方 **OpenHands Software Agent SDK / Tools / agent-server 1.62.0** 的配置驱动业务 Agent API。这是本分支唯一实现，根目录默认部署直接启动 OpenHands；旧方案保留在主分支。
 
 核心区别：用户文件已经在服务器上；服务端将预配置的租户目录直接读写挂载到执行容器 `/workspace`。没有上传接口，也不复制整个工作区。Agent 的编辑立即反映在原目录。
 
@@ -16,7 +16,7 @@ openhands/
   pyproject.toml        # 独立 Python 依赖
   Dockerfile
   .env.example
-compose.openhands.yaml  # 独立部署，不覆盖 compose.yaml
+compose.yaml            # 仓库根目录默认部署
 ```
 
 ## 本机启动（Linux Docker 宿主机）
@@ -51,11 +51,11 @@ curl http://127.0.0.1:8001/v1/models -H "Authorization: Bearer $CLOUDAGENT_API_K
 ## Docker Compose 启动
 
 ```bash
-cp openhands/.env.example openhands/.env
-# 编辑 openhands/.env：API Key、专用模型 Key、Docker 宿主机绝对目录映射。
+cp .env.example .env
+# 编辑 .env：API Key、专用模型 Key、Docker 宿主机绝对目录映射。
 # 预先创建各租户目录，并让执行镜像的非 root 用户可读写；不要 chmod 整个服务器目录。
-docker compose --env-file openhands/.env -f compose.openhands.yaml --profile image build
-docker compose --env-file openhands/.env -f compose.openhands.yaml up -d openhands-api
+docker compose --profile image build
+docker compose up -d openhands-api
 ```
 
 这是 Linux host-network 部署，监听 `127.0.0.1:8001`。API 容器以只读方式看见相同宿主路径来验证配置；每个执行容器只得到一个租户根目录的读写挂载。主机模型地址不能写成仅容器自身可见的 `127.0.0.1`，要使用从执行容器可达的模型服务地址。镜像用户 UID/GID 与目录权限须在目标服务器核对。
@@ -136,6 +136,6 @@ RUN_OPENHANDS_DOCKER_TESTS=1 uv run --project openhands --frozen pytest openhand
 
 默认测试包括真实 SDK + 本地官方 agent-server + 脚本化模型服务的集成，但没有调用付费模型；Docker 测试需显式开启，未开启显示 skipped。SSE 测试将模型的结束信号暂扣，确认 token 已提前到达客户端，不以最终文本切片冒充流式。
 
-子 Agent 当前继承父 Agent 的 provider 模型和 temperature，不同配置会被拒绝。原生 `finish` 是额外的会话终止工具。每个 Agent 使用原生单工具并发，叶子不能进一步委派，所有请求受总运行超时约束；尚未实现旧版精确的共享模型调用/token 配额。`max_budget` 是 SDK 依赖模型价格信息的估算，不能当作供应商账单硬限额。
+子 Agent 当前继承父 Agent 的 provider 模型和 temperature，不同配置会被拒绝。原生 `finish` 是额外的会话终止工具。每个 Agent 使用原生单工具并发，叶子不能进一步委派，所有请求受总运行超时约束；尚未实现精确的共享模型调用/token 配额。`max_budget` 是 SDK 依赖模型价格信息的估算，不能当作供应商账单硬限额。
 
-控制器为同一 state_dir/deployment_id 加进程锁，启动时回收该部署标签的孤儿容器。清理失败会保留工作区占额并每5秒重试；如果控制器强制终止且一直未重启，容器不会像 OpenSandbox TTL 一样自动到期。部署方须监控残留容器和 Docker 磁盘。不同实例必须使用不同 deployment_id 与工作区；不支持跨机复制调度。
+控制器为同一 state_dir/deployment_id 加进程锁，启动时回收该部署标签的孤儿容器。清理失败会保留工作区占额并每5秒重试；如果控制器强制终止且一直未重启，容器不会自动到期。部署方须监控残留容器和 Docker 磁盘。不同实例必须使用不同 deployment_id 与工作区；不支持跨机复制调度。
