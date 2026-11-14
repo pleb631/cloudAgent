@@ -410,7 +410,22 @@ async def test_docker_runtime_real_mount_usage_and_cleanup(tmp_path):
             run_timeout=120,
             request_timeout=30,
         )
-        runtime = OpenHandsRuntime(settings, AgentRegistry([config]), docker_client=client)
+
+        class DiagnosticRuntime(OpenHandsRuntime):
+            async def _healthy(self, host):
+                try:
+                    await super()._healthy(host)
+                except Exception:
+                    # This test uses only fake credentials and a disposable workspace.
+                    # Capture before stream's finally block removes the container.
+                    for run in self.runs.values():
+                        if run.container is not None:
+                            run.container.reload()
+                            print("Container startup state:", run.container.attrs.get("State"))
+                            print(run.container.logs(tail=100).decode(errors="replace"))
+                    raise
+
+        runtime = DiagnosticRuntime(settings, AgentRegistry([config]), docker_client=client)
         try:
             await runtime.start()
             async with asyncio.timeout(150):
