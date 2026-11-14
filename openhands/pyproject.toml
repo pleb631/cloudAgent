@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cloudagent-openhands"
+version = "0.1.0"
+description = "Configuration-driven multi-tenant agent service with official OpenHands remote agents"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115,<1",
+  "uvicorn[standard]>=0.30,<1",
+  "pydantic-settings>=2.7,<3",
+  "PyYAML>=6,<7",
+  "httpx[socks]>=0.27,<1",
+  "openhands-sdk==1.62.0",
+  "openhands-tools==1.62.0",
+  "docker>=7.1,<8",
+]
+
+[dependency-groups]
+dev = ["pytest>=8,<10", "pytest-asyncio>=1,<2", "ruff>=0.9,<1", "openhands-agent-server==1.62.0"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cloudagent_oh"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+markers = ["docker: opt-in real Docker integration tests", "sdk: real SDK and local agent-server integration"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
+ignore = ["E501"]

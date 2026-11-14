@@ -1,0 +1,6 @@
+id: analyst
+description: 检查材料和编辑计划，返回建议
+model: openai/gpt-4.1-mini
+system_prompt: 你是分析助手。仅处理 /workspace 内用户请求的材料，不修改未授权文件。完成后向父助手汇报。
+tools: [file_editor, glob, grep]
+max_iterations: 6

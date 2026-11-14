@@ -17,3 +17,11 @@ smoke:
 format:
 	cd agent && uv run --frozen ruff check --fix . && uv run --frozen ruff format .
 	cd sandbox && uv run --frozen ruff check --fix . && uv run --frozen ruff format .
+
+.PHONY: openhands-install openhands-test openhands-lint
+openhands-install:
+	cd openhands && uv sync --frozen --group dev
+openhands-test:
+	cd openhands && uv run --frozen pytest -q
+openhands-lint:
+	cd openhands && uv run --frozen ruff check . && uv run --frozen ruff format --check .

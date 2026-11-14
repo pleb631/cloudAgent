@@ -1,0 +1,9 @@
+id: assistant
+description: 编辑服务器上当前租户工作区的业务助手
+model: openai/gpt-4.1-mini
+system_prompt_file: assistant.md
+tools: [terminal, file_editor, glob, grep, task_tracker, task_tool_set]
+skill_files:
+  careful_editing: skills/editing.md
+subagents: [analyst]
+max_iterations: 12

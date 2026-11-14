@@ -112,3 +112,7 @@ CI 分开执行单元测试、模拟 HTTP 测试，以及真实官方服务/SDK/
 详见 [Agent 配置](agent/README.md)、[官方沙箱部署](sandbox/README.md)、[架构](docs/architecture.md)和[安全说明](docs/security.md)。
 
 容量估算、sidecar/磁盘限制和资源耗尽处置见[单主机容量与故障处置](docs/resource-capacity.md)。默认部署不提供覆盖执行容器、sidecar 和磁盘的聚合硬预算。
+
+## OpenHands 对照实现
+
+`feat/openhands-platform` 分支新增独立的 [OpenHands SDK 方案](openhands/README.md)，用于直接挂载并修改服务器上已有的租户目录。使用独立 `compose.openhands.yaml` 和端口 8001，不替换上面的 Deep Agents / OpenSandbox 默认部署。配置、运行模型及安全差异见 [对比说明](docs/openhands-comparison.md)。

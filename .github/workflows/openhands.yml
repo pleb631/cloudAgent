@@ -1,0 +1,49 @@
+name: OpenHands comparison
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  sdk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      OPENHANDS_SUPPRESS_BANNER: "1"
+      LITELLM_LOCAL_MODEL_COST_MAP: "True"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.13.6"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: make openhands-install
+      - run: make openhands-lint
+      - run: make openhands-test
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      RUN_OPENHANDS_DOCKER_TESTS: "1"
+      OPENHANDS_SUPPRESS_BANNER: "1"
+      LITELLM_LOCAL_MODEL_COST_MAP: "True"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.13.6"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: make openhands-install
+      - name: Build pinned official server with configuration policy
+        run: docker build -t cloudagent-openhands-server:1.62.0 openhands/server
+      - name: Real Docker, mounted workspace, SDK and streamed model stub
+        run: cd openhands && uv run --frozen pytest tests/test_sdk_integration.py -m docker -v
+      - name: Build deployable API image
+        run: docker build -t cloudagent-openhands-api:ci openhands
+      - name: Resource inventory
+        if: always()
+        run: docker ps -a --filter label=io.cloudagent.openhands.deployment
