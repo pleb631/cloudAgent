@@ -79,3 +79,12 @@ def test_reload_cannot_bypass_policy(monkeypatch):
     monkeypatch.setattr(policy.sys, "argv", [str(SHIM_PATH), "--reload"])
     with pytest.raises(RuntimeError, match="Reload is disabled"):
         policy.main()
+
+
+def test_image_builds_locked_policy_interpreter():
+    dockerfile = (SHIM_PATH.parent / "Dockerfile").read_text()
+    assert "UV_PROJECT_ENVIRONMENT=/opt/cloudagent/venv" in dockerfile
+    assert "uv sync --frozen" in dockerfile
+    assert '"/opt/cloudagent/venv/bin/python"' in dockerfile
+    assert "/agent-server/.venv" not in dockerfile.split("ENTRYPOINT", 1)[1]
+    assert "USER openhands" in dockerfile

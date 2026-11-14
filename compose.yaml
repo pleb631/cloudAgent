@@ -1,7 +1,9 @@
 # Linux only. OpenHands is the sole implementation on this branch.
 services:
   openhands-server-image:
-    build: ./openhands/server
+    build:
+      context: ./openhands
+      dockerfile: server/Dockerfile
     image: cloudagent-openhands-server:1.62.0
     profiles: [image]
     entrypoint: ["/bin/true"]

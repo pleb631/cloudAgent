@@ -33,7 +33,7 @@ export CLOUDAGENT_OH_WORKSPACE_ROOTS="{\"demo\":\"$HOME/cloudagent-demo\"}"
 read -rsp 'Model API key: ' CLOUDAGENT_OH_LLM_API_KEY; echo
 export CLOUDAGENT_OH_LLM_API_KEY
 export CLOUDAGENT_OH_AGENTS_DIR="$PWD/openhands/agents"
-docker build -t cloudagent-openhands-server:1.62.0 openhands/server
+docker build -t cloudagent-openhands-server:1.62.0 -f openhands/server/Dockerfile openhands
 cd openhands
 uv sync
 uv run uvicorn cloudagent_oh.api:app --host 127.0.0.1 --port 8001 --workers 1

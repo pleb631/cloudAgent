@@ -39,7 +39,7 @@ jobs:
           python-version: "3.12"
       - run: make openhands-install
       - name: Build pinned official server with configuration policy
-        run: docker build -t cloudagent-openhands-server:1.62.0 openhands/server
+        run: docker build -t cloudagent-openhands-server:1.62.0 -f openhands/server/Dockerfile openhands
       - name: Validate policy image entrypoint
         run: docker run --rm cloudagent-openhands-server:1.62.0 --help
       - name: Real Docker, mounted workspace, SDK and streamed model stub
